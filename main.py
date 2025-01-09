@@ -73,6 +73,7 @@ DEFAULT_CONFIG = {
     "General": {"log_level": "INFO"},
 }
 
+
 def ensure_config_exists(config_path: str):
     if not os.path.exists(config_path):
         config = configparser.ConfigParser()
@@ -81,10 +82,12 @@ def ensure_config_exists(config_path: str):
         with open(config_path, "w", encoding="utf-8") as f:
             config.write(f)
 
+
 def load_config(config_path: str) -> configparser.ConfigParser:
     config = configparser.ConfigParser()
     config.read(config_path, encoding="utf-8")
     return config
+
 
 def setup_logging():
     logs_dir = "logs"
@@ -100,7 +103,10 @@ def setup_logging():
     )
     logging.info("Logging started.")
 
-def connect_to_sql_server_for_db(config: configparser.ConfigParser, db_name: str) -> pyodbc.Connection:
+
+def connect_to_sql_server_for_db(
+    config: configparser.ConfigParser, db_name: str
+) -> pyodbc.Connection:
     server = config["Database"]["server"]
     username = config["Database"]["username"]
     password = config["Database"]["password"]
@@ -114,6 +120,7 @@ def connect_to_sql_server_for_db(config: configparser.ConfigParser, db_name: str
     )
     return pyodbc.connect(conn_str)
 
+
 def fetch_tables_list(connection: pyodbc.Connection):
     with connection.cursor() as cursor:
         cursor.execute("""
@@ -123,14 +130,21 @@ def fetch_tables_list(connection: pyodbc.Connection):
         """)
         return [row[0] for row in cursor.fetchall()]
 
-def fetch_table_data_as_csv(connection: pyodbc.Connection, table_name: str) -> str:
+
+def fetch_table_data_as_csv(
+    connection: pyodbc.Connection, table_name: str, db_name: str
+) -> str:
     csv_dir = "generated_csv"
     os.makedirs(csv_dir, exist_ok=True)
     csv_file = os.path.join(
-        csv_dir, f"{table_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        csv_dir,
+        f"{db_name}_{table_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
     )
 
-    with connection.cursor() as cursor, open(csv_file, "w", newline="", encoding="utf-8") as f:
+    with (
+        connection.cursor() as cursor,
+        open(csv_file, "w", newline="", encoding="utf-8") as f,
+    ):
         writer = csv.writer(f)
         cursor.execute(f"SELECT * FROM [{table_name}]")
         writer.writerow([desc[0] for desc in cursor.description])
@@ -139,6 +153,7 @@ def fetch_table_data_as_csv(connection: pyodbc.Connection, table_name: str) -> s
 
     return csv_file
 
+
 def compute_file_hash(filepath: str) -> str:
     hasher = hashlib.md5()
     with open(filepath, "rb") as f:
@@ -146,11 +161,9 @@ def compute_file_hash(filepath: str) -> str:
         hasher.update(data)
     return hasher.hexdigest()
 
+
 def send_csv_to_odoo(
-    config: configparser.ConfigParser,
-    csv_file: str,
-    table_name: str,
-    db_name: str
+    config: configparser.ConfigParser, csv_file: str, table_name: str, db_name: str
 ):
     url = config["Odoo"]["url"]
     db = config["Odoo"]["db"]
@@ -295,11 +308,13 @@ def send_csv_to_odoo(
         f"(sync_data_id: {sync_data_id}). Duplicate table details removed if found."
     )
 
+
 def get_icon_path():
     if getattr(sys, "frozen", False):
         return os.path.join(sys._MEIPASS, "icon.ico")  # Used in pyinstaller
     else:
         return "icon.ico"
+
 
 class MainWindow(QMainWindow):
     def __init__(self, config_path, *args, **kwargs):
@@ -484,14 +499,20 @@ class MainWindow(QMainWindow):
 
                     to_sync = self.tables_edit.text().strip()
                     if to_sync:
-                        table_list = [x.strip() for x in to_sync.split(",") if x.strip()]
+                        table_list = [
+                            x.strip() for x in to_sync.split(",") if x.strip()
+                        ]
                     else:
                         table_list = all_tables
 
                     for table in table_list:
-                        csv_file_path = fetch_table_data_as_csv(connection, table)
+                        csv_file_path = fetch_table_data_as_csv(
+                            connection, table, db_name
+                        )
                         file_hash = compute_file_hash(csv_file_path)
-                        prev_hash_path = os.path.join("generated_csv", f"{table}_hash.txt")
+                        prev_hash_path = os.path.join(
+                            "generated_csv", f"{db_name}_{table}_hash.txt"
+                        )
 
                         if os.path.exists(prev_hash_path):
                             with open(prev_hash_path, "r", encoding="utf-8") as hf:
@@ -505,7 +526,7 @@ class MainWindow(QMainWindow):
                                 hf.write(file_hash)
                         else:
                             logging.info(
-                                f"No change detected for table '{table}' in DB '{db_name}'. Skipping upload."
+                                f"No change detected for table `{table}` in DB `{db_name}`. Skipping upload."
                             )
 
             logging.info("Sync completed successfully.")
@@ -518,6 +539,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             logging.error("Error during sync: %s\n%s", e, traceback.format_exc())
             QMessageBox.critical(self, "Sync Error", str(e))
+
 
 def main():
     config_path = "config.ini"
@@ -537,6 +559,7 @@ def main():
         sys.exit(app.exec())
     except Exception as exc:
         logging.error("Fatal error on exit: %s", exc)
+
 
 if __name__ == "__main__":
     main()
