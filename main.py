@@ -31,7 +31,6 @@ import traceback
 import hashlib
 from pathlib import Path
 
-# PyQt6 imports
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -50,17 +49,13 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtGui import QIcon, QAction, QCursor
 from PyQt6.QtCore import QTimer, Qt
 
-# SQL connection
 import pyodbc
-
-# For Odoo XMLRPC
 import xmlrpc.client
 
-# -------------- Default Config Values --------------
 DEFAULT_CONFIG = {
     "Database": {
         "server": "localhost",
-        "database": "testdb",
+        "databases": "testdb1, testdb2",
         "username": "sa",
         "password": "YourPassword123",
     },
@@ -71,40 +66,27 @@ DEFAULT_CONFIG = {
         "password": "admin",
     },
     "Sync": {
-        "tables_to_sync": "",  # comma separated or empty
-        "sync_period": "60",  # in seconds
-        "force_sync": "False",  # optional
+        "tables_to_sync": "",
+        "sync_period": "60",
+        "force_sync": "False",
     },
     "General": {"log_level": "INFO"},
 }
 
-
-# -------------- Helper Functions --------------
 def ensure_config_exists(config_path: str):
-    """
-    If config.ini doesn't exist, create it with default values.
-    """
     if not os.path.exists(config_path):
         config = configparser.ConfigParser()
         for section, values in DEFAULT_CONFIG.items():
             config[section] = values
-        with open(config_path, "w") as f:
+        with open(config_path, "w", encoding="utf-8") as f:
             config.write(f)
 
-
-def load_config(config_path: str):
-    """
-    Load and return config as a ConfigParser object.
-    """
+def load_config(config_path: str) -> configparser.ConfigParser:
     config = configparser.ConfigParser()
-    config.read(config_path)
+    config.read(config_path, encoding="utf-8")
     return config
 
-
 def setup_logging():
-    """
-    Setup logging into 'logs' folder with date-time-based filenames.
-    """
     logs_dir = "logs"
     os.makedirs(logs_dir, exist_ok=True)
     log_filename = datetime.datetime.now().strftime("%Y%m%d_%H%M%S.log")
@@ -118,81 +100,58 @@ def setup_logging():
     )
     logging.info("Logging started.")
 
-
-def connect_to_sql_server(config: configparser.ConfigParser):
-    """
-    Create and return a pyodbc connection to SQL Server using config.
-    """
+def connect_to_sql_server_for_db(config: configparser.ConfigParser, db_name: str) -> pyodbc.Connection:
     server = config["Database"]["server"]
-    database = config["Database"]["database"]
     username = config["Database"]["username"]
     password = config["Database"]["password"]
 
     conn_str = (
         f"Driver={{SQL Server}};"
         f"Server={server};"
-        f"Database={database};"
+        f"Database={db_name};"
         f"UID={username};"
         f"PWD={password};"
     )
     return pyodbc.connect(conn_str)
 
+def fetch_tables_list(connection: pyodbc.Connection):
+    with connection.cursor() as cursor:
+        cursor.execute("""
+            SELECT TABLE_NAME
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_TYPE='BASE TABLE'
+        """)
+        return [row[0] for row in cursor.fetchall()]
 
-def fetch_tables_list(connection):
-    """
-    Return a list of all user table names in the connected database.
-    """
-    cursor = connection.cursor()
-    # For MS SQL, you can query INFORMATION_SCHEMA.TABLES
-    cursor.execute("""
-        SELECT TABLE_NAME
-        FROM INFORMATION_SCHEMA.TABLES
-        WHERE TABLE_TYPE='BASE TABLE'
-    """)
-    return [row[0] for row in cursor.fetchall()]
-
-
-def fetch_table_data_as_csv(connection, table_name: str) -> str:
-    """
-    Fetch data from a given table and return the CSV file path.
-    """
-    cursor = connection.cursor()
-    cursor.execute(f"SELECT * FROM [{table_name}]")
-
-    # CSV file name with timestamp
+def fetch_table_data_as_csv(connection: pyodbc.Connection, table_name: str) -> str:
     csv_dir = "generated_csv"
     os.makedirs(csv_dir, exist_ok=True)
     csv_file = os.path.join(
         csv_dir, f"{table_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
     )
 
-    # Write CSV file
-    with open(csv_file, "w", newline="", encoding="utf-8") as f:
+    with connection.cursor() as cursor, open(csv_file, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        # Write header
+        cursor.execute(f"SELECT * FROM [{table_name}]")
         writer.writerow([desc[0] for desc in cursor.description])
-        # Write rows
         for row in cursor.fetchall():
             writer.writerow(row)
 
     return csv_file
 
-
 def compute_file_hash(filepath: str) -> str:
-    """
-    Compute a simple hash of file content to detect changes.
-    """
     hasher = hashlib.md5()
     with open(filepath, "rb") as f:
         data = f.read()
         hasher.update(data)
     return hasher.hexdigest()
 
-
-def send_csv_to_odoo(config: configparser.ConfigParser, csv_file: str, table_name: str):
-    """
-    Send the CSV file to Odoo and create records in mssql.sync.data models.
-    """
+def send_csv_to_odoo(
+    config: configparser.ConfigParser,
+    csv_file: str,
+    table_name: str,
+    db_name: str
+):
     url = config["Odoo"]["url"]
     db = config["Odoo"]["db"]
     username = config["Odoo"]["username"]
@@ -205,14 +164,11 @@ def send_csv_to_odoo(config: configparser.ConfigParser, csv_file: str, table_nam
 
     models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
 
-    # Upload file as attachment
     with open(csv_file, "rb") as f:
         file_data = f.read()
-
     file_base64 = base64.b64encode(file_data).decode("utf-8")
     file_name = os.path.basename(csv_file)
 
-    # Create attachment
     attachment_id = models.execute_kw(
         db,
         uid,
@@ -222,29 +178,24 @@ def send_csv_to_odoo(config: configparser.ConfigParser, csv_file: str, table_nam
         [{"name": file_name, "datas": file_base64, "mimetype": "text/csv"}],
     )
 
-    # Get table structure information
-    connection = connect_to_sql_server(config)
-    cursor = connection.cursor()
-    cursor.execute(f"""
-        SELECT 
-            COLUMN_NAME,
-            DATA_TYPE,
-            IS_NULLABLE,
-            CHARACTER_MAXIMUM_LENGTH,
-            COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') as IS_PRIMARY_KEY
-        FROM INFORMATION_SCHEMA.COLUMNS 
-        WHERE TABLE_NAME = '{table_name}'
-    """)
-    columns = cursor.fetchall()
-    connection.close()
+    with connect_to_sql_server_for_db(config, db_name) as conn, conn.cursor() as cursor:
+        cursor.execute(f"""
+            SELECT 
+                COLUMN_NAME,
+                DATA_TYPE,
+                IS_NULLABLE,
+                CHARACTER_MAXIMUM_LENGTH,
+                COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') as IS_PRIMARY_KEY
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_NAME = '{table_name}'
+        """)
+        columns = cursor.fetchall()
 
-    # Create or update mssql.sync.data record
     sync_data = {
         "name": table_name,
-        "database_name": config["Database"]["database"],
+        "database_name": db_name,
     }
 
-    # Search for existing record
     existing_ids = models.execute_kw(
         db,
         uid,
@@ -254,7 +205,9 @@ def send_csv_to_odoo(config: configparser.ConfigParser, csv_file: str, table_nam
         [
             [
                 ["name", "=", table_name],
-                ["database_name", "=", config["Database"]["database"]],
+                # Using "db_name" rather than "config['Database']['database']"
+                # since we handle multiple DBs in a loop
+                ["database_name", "=", db_name],
             ]
         ],
     )
@@ -262,14 +215,13 @@ def send_csv_to_odoo(config: configparser.ConfigParser, csv_file: str, table_nam
     if existing_ids:
         sync_data_id = existing_ids[0]
         models.execute_kw(
-            db, uid, password, "mssql.sync.data", "write", [sync_data_id, sync_data]
+            db, uid, password, "mssql.sync.data", "write", [[sync_data_id], sync_data]
         )
     else:
         sync_data_id = models.execute_kw(
             db, uid, password, "mssql.sync.data", "create", [sync_data]
         )
 
-    # Create table details records
     for column in columns:
         column_data = {
             "sync_data_id": sync_data_id,
@@ -280,107 +232,101 @@ def send_csv_to_odoo(config: configparser.ConfigParser, csv_file: str, table_nam
             "is_primary_key": bool(column[4]),
         }
         models.execute_kw(
-            db, uid, password, "mssql.sync.table.details", "create", [column_data]
+            db,
+            uid,
+            password,
+            "mssql.sync.table.details",
+            "create",
+            [column_data],
         )
 
-    # Create table data record linking to attachment
     table_data = {"sync_data_id": sync_data_id, "attachment_id": attachment_id}
     models.execute_kw(
         db, uid, password, "mssql.sync.table.data", "create", [table_data]
     )
 
     logging.info(
-        f"Uploaded {file_name} to Odoo and created sync records (sync_data_id: {sync_data_id})"
+        f"Uploaded {file_name} to Odoo for table '{table_name}' in DB '{db_name}' "
+        f"(sync_data_id: {sync_data_id})"
     )
-
 
 def get_icon_path():
     if getattr(sys, "frozen", False):
-        # Running as compiled exe
-        return os.path.join(sys._MEIPASS, "icon.ico")
+        return os.path.join(sys._MEIPASS, "icon.ico")  # Used in pyinstaller
     else:
-        # Running as script
         return "icon.ico"
 
-
-# -------------- Main Window with Tray --------------
 class MainWindow(QMainWindow):
     def __init__(self, config_path, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.config_path = config_path
         self.config = load_config(config_path)
 
-        # Setup UI
         self.setWindowTitle("SQL to Odoo Sync App")
         self.resize(600, 300)
 
-        # Central widget
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
-
         layout = QVBoxLayout()
         central_widget.setLayout(layout)
 
-        # Database Info
+        # Database UI
         db_layout = QHBoxLayout()
         db_layout.addWidget(QLabel("SQL Server:"))
         self.db_server_edit = QLineEdit(self.config["Database"]["server"])
         db_layout.addWidget(self.db_server_edit)
+        layout.addLayout(db_layout)
 
         db_layout2 = QHBoxLayout()
-        db_layout2.addWidget(QLabel("Database:"))
-        self.db_name_edit = QLineEdit(self.config["Database"]["database"])
-        db_layout2.addWidget(self.db_name_edit)
+        db_layout2.addWidget(QLabel("Databases (comma-separated):"))
+        self.db_databases_edit = QLineEdit(self.config["Database"]["databases"])
+        db_layout2.addWidget(self.db_databases_edit)
+        layout.addLayout(db_layout2)
 
         db_layout3 = QHBoxLayout()
         db_layout3.addWidget(QLabel("Username:"))
         self.db_user_edit = QLineEdit(self.config["Database"]["username"])
         db_layout3.addWidget(self.db_user_edit)
+        layout.addLayout(db_layout3)
 
         db_layout4 = QHBoxLayout()
         db_layout4.addWidget(QLabel("Password:"))
         self.db_pass_edit = QLineEdit(self.config["Database"]["password"])
         self.db_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
         db_layout4.addWidget(self.db_pass_edit)
-
-        layout.addLayout(db_layout)
-        layout.addLayout(db_layout2)
-        layout.addLayout(db_layout3)
         layout.addLayout(db_layout4)
 
-        # Odoo Info
+        # Odoo UI
         odoo_layout = QHBoxLayout()
         odoo_layout.addWidget(QLabel("Odoo URL:"))
         self.odoo_url_edit = QLineEdit(self.config["Odoo"]["url"])
         odoo_layout.addWidget(self.odoo_url_edit)
+        layout.addLayout(odoo_layout)
 
         odoo_layout2 = QHBoxLayout()
         odoo_layout2.addWidget(QLabel("DB:"))
         self.odoo_db_edit = QLineEdit(self.config["Odoo"]["db"])
         odoo_layout2.addWidget(self.odoo_db_edit)
+        layout.addLayout(odoo_layout2)
 
         odoo_layout3 = QHBoxLayout()
         odoo_layout3.addWidget(QLabel("User:"))
         self.odoo_user_edit = QLineEdit(self.config["Odoo"]["username"])
         odoo_layout3.addWidget(self.odoo_user_edit)
+        layout.addLayout(odoo_layout3)
 
         odoo_layout4 = QHBoxLayout()
         odoo_layout4.addWidget(QLabel("Password:"))
         self.odoo_pass_edit = QLineEdit(self.config["Odoo"]["password"])
         self.odoo_pass_edit.setEchoMode(QLineEdit.EchoMode.Password)
         odoo_layout4.addWidget(self.odoo_pass_edit)
-
-        layout.addLayout(odoo_layout)
-        layout.addLayout(odoo_layout2)
-        layout.addLayout(odoo_layout3)
         layout.addLayout(odoo_layout4)
 
-        # Sync Config
+        # Sync UI
         sync_layout = QHBoxLayout()
         sync_layout.addWidget(QLabel("Tables (comma-separated, empty=all):"))
         self.tables_edit = QLineEdit(self.config["Sync"]["tables_to_sync"])
         sync_layout.addWidget(self.tables_edit)
-
         layout.addLayout(sync_layout)
 
         sync_layout2 = QHBoxLayout()
@@ -404,19 +350,16 @@ class MainWindow(QMainWindow):
         self.sync_btn = QPushButton("Sync Now")
         self.sync_btn.clicked.connect(self.perform_sync)
         btn_layout.addWidget(self.sync_btn)
-
         layout.addLayout(btn_layout)
 
-        # Timer for periodic sync
+        # Timer
         self.timer = QTimer()
         self.timer.setInterval(int(self.config["Sync"]["sync_period"]) * 1000)
         self.timer.timeout.connect(self.perform_sync)
         self.timer.start()
 
-        # Set up tray icon
+        # Tray icon
         icon = QIcon(get_icon_path())
-
-        # Create menu before creating tray icon
         self.tray_menu = QMenu()
 
         show_action = QAction("Show", self)
@@ -431,33 +374,23 @@ class MainWindow(QMainWindow):
         exit_action.triggered.connect(self.exit_app)
         self.tray_menu.addAction(exit_action)
 
-        # Create tray icon and set its menu
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(icon)
         self.tray_icon.setToolTip("SQL to Odoo Sync")
         self.tray_icon.setContextMenu(self.tray_menu)
         self.tray_icon.show()
-
-        # Connect activation signal
         self.tray_icon.activated.connect(self.on_tray_icon_activated)
 
     def on_tray_icon_activated(self, reason):
-        if reason == QSystemTrayIcon.ActivationReason.Context:
-            # Right-click - no need to manually show the menu
-            pass
-        elif reason == QSystemTrayIcon.ActivationReason.Trigger:
-            # Left-click
+        if reason == QSystemTrayIcon.ActivationReason.Trigger:
             self.show_main_window()
 
     def closeEvent(self, event):
-        """
-        Override close event to minimize to tray instead of quitting.
-        """
         event.ignore()
         self.hide()
         self.tray_icon.showMessage(
             "Still Running",
-            "The app is minimized to tray and running in background.",
+            "The app is minimized to tray and running in the background.",
             QSystemTrayIcon.MessageIcon.Information,
             3000,
         )
@@ -471,11 +404,8 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def save_config(self):
-        """
-        Save the current UI config back to config.ini.
-        """
         self.config["Database"]["server"] = self.db_server_edit.text()
-        self.config["Database"]["database"] = self.db_name_edit.text()
+        self.config["Database"]["databases"] = self.db_databases_edit.text()
         self.config["Database"]["username"] = self.db_user_edit.text()
         self.config["Database"]["password"] = self.db_pass_edit.text()
 
@@ -488,55 +418,51 @@ class MainWindow(QMainWindow):
         self.config["Sync"]["sync_period"] = str(self.sync_spin.value())
         self.config["Sync"]["force_sync"] = str(self.force_check.isChecked())
 
-        with open(self.config_path, "w") as f:
+        with open(self.config_path, "w", encoding="utf-8") as f:
             self.config.write(f)
 
-        # Restart timer with new interval
         self.timer.setInterval(int(self.config["Sync"]["sync_period"]) * 1000)
-
         logging.info("Configuration saved.")
         QMessageBox.information(
             self, "Config Saved", "Configuration successfully saved."
         )
 
     def perform_sync(self):
-        """
-        Perform the table(s) sync: fetch SQL data, compare, send to Odoo if changed or forced.
-        """
         force = self.force_check.isChecked()
         try:
-            connection = connect_to_sql_server(self.config)
-            all_tables = fetch_tables_list(connection)
+            databases_str = self.config["Database"]["databases"]
+            database_list = [d.strip() for d in databases_str.split(",") if d.strip()]
 
-            to_sync = self.tables_edit.text().strip()
-            if to_sync:
-                table_list = [x.strip() for x in to_sync.split(",") if x.strip()]
-            else:
-                table_list = all_tables
+            for db_name in database_list:
+                with connect_to_sql_server_for_db(self.config, db_name) as connection:
+                    all_tables = fetch_tables_list(connection)
 
-            for table in table_list:
-                csv_file_path = fetch_table_data_as_csv(connection, table)
-                file_hash = compute_file_hash(csv_file_path)
-                prev_hash_path = os.path.join("generated_csv", f"{table}_hash.txt")
+                    to_sync = self.tables_edit.text().strip()
+                    if to_sync:
+                        table_list = [x.strip() for x in to_sync.split(",") if x.strip()]
+                    else:
+                        table_list = all_tables
 
-                if os.path.exists(prev_hash_path):
-                    with open(prev_hash_path, "r") as hf:
-                        old_hash = hf.read().strip()
-                else:
-                    old_hash = ""
+                    for table in table_list:
+                        csv_file_path = fetch_table_data_as_csv(connection, table)
+                        file_hash = compute_file_hash(csv_file_path)
+                        prev_hash_path = os.path.join("generated_csv", f"{table}_hash.txt")
 
-                if force or (file_hash != old_hash):
-                    # Upload to Odoo with table name
-                    send_csv_to_odoo(self.config, csv_file_path, table)
+                        if os.path.exists(prev_hash_path):
+                            with open(prev_hash_path, "r", encoding="utf-8") as hf:
+                                old_hash = hf.read().strip()
+                        else:
+                            old_hash = ""
 
-                    with open(prev_hash_path, "w") as hf:
-                        hf.write(file_hash)
-                else:
-                    logging.info(
-                        f"No change detected for table {table}. Skipping upload."
-                    )
+                        if force or (file_hash != old_hash):
+                            send_csv_to_odoo(self.config, csv_file_path, table, db_name)
+                            with open(prev_hash_path, "w", encoding="utf-8") as hf:
+                                hf.write(file_hash)
+                        else:
+                            logging.info(
+                                f"No change detected for table '{table}' in DB '{db_name}'. Skipping upload."
+                            )
 
-            connection.close()
             logging.info("Sync completed successfully.")
             self.tray_icon.showMessage(
                 "Sync Completed",
@@ -544,34 +470,28 @@ class MainWindow(QMainWindow):
                 QSystemTrayIcon.MessageIcon.Information,
                 3000,
             )
-
         except Exception as e:
-            logging.error(f"Error during sync: {e}\n{traceback.format_exc()}")
+            logging.error("Error during sync: %s\n%s", e, traceback.format_exc())
             QMessageBox.critical(self, "Sync Error", str(e))
 
-
-# -------------- Main Entry Point --------------
 def main():
-    # Ensure config.ini
     config_path = "config.ini"
     ensure_config_exists(config_path)
-
-    # Setup logging
     setup_logging()
 
-    # Start PyQt app
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
-    # Load icon from base64
     icon = QIcon(get_icon_path())
     app.setWindowIcon(icon)
 
-    main_window = MainWindow(config_path)
-    main_window.show()
+    window = MainWindow(config_path)
+    window.show()
 
-    sys.exit(app.exec())
-
+    try:
+        sys.exit(app.exec())
+    except Exception as exc:
+        logging.error("Fatal error on exit: %s", exc)
 
 if __name__ == "__main__":
     main()
