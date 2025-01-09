@@ -205,8 +205,6 @@ def send_csv_to_odoo(
         [
             [
                 ["name", "=", table_name],
-                # Using "db_name" rather than "config['Database']['database']"
-                # since we handle multiple DBs in a loop
                 ["database_name", "=", db_name],
             ]
         ],
@@ -222,22 +220,69 @@ def send_csv_to_odoo(
             db, uid, password, "mssql.sync.data", "create", [sync_data]
         )
 
+    # Only create details if they do not already exist
     for column in columns:
-        column_data = {
-            "sync_data_id": sync_data_id,
-            "column_name": column[0],
-            "data_type": column[1],
-            "is_nullable": column[2] == "YES",
-            "max_length": column[3] or 0,
-            "is_primary_key": bool(column[4]),
-        }
+        column_name = column[0]
+        existing_detail_ids = models.execute_kw(
+            db,
+            uid,
+            password,
+            "mssql.sync.table.details",
+            "search",
+            [
+                [
+                    ["sync_data_id", "=", sync_data_id],
+                    ["column_name", "=", column_name],
+                ]
+            ],
+        )
+
+        if not existing_detail_ids:
+            column_data = {
+                "sync_data_id": sync_data_id,
+                "column_name": column_name,
+                "data_type": column[1],
+                "is_nullable": column[2] == "YES",
+                "max_length": column[3] or 0,
+                "is_primary_key": bool(column[4]),
+            }
+            models.execute_kw(
+                db,
+                uid,
+                password,
+                "mssql.sync.table.details",
+                "create",
+                [column_data],
+            )
+
+    # Clean up any duplicates that may already be in the database
+    existing_details = models.execute_kw(
+        db,
+        uid,
+        password,
+        "mssql.sync.table.details",
+        "search_read",
+        [[["sync_data_id", "=", sync_data_id]]],
+        {"fields": ["id", "column_name"], "order": "column_name"},
+    )
+
+    duplicates_to_remove = []
+    unique_cols = set()
+    for detail in existing_details:
+        col_name = detail["column_name"]
+        if col_name in unique_cols:
+            duplicates_to_remove.append(detail["id"])
+        else:
+            unique_cols.add(col_name)
+
+    if duplicates_to_remove:
         models.execute_kw(
             db,
             uid,
             password,
             "mssql.sync.table.details",
-            "create",
-            [column_data],
+            "unlink",
+            [duplicates_to_remove],
         )
 
     table_data = {"sync_data_id": sync_data_id, "attachment_id": attachment_id}
@@ -246,8 +291,8 @@ def send_csv_to_odoo(
     )
 
     logging.info(
-        f"Uploaded {file_name} to Odoo for table '{table_name}' in DB '{db_name}' "
-        f"(sync_data_id: {sync_data_id})"
+        f"Uploaded `{file_name}` to Odoo for table `{table_name}` in DB `{db_name}` "
+        f"(sync_data_id: {sync_data_id}). Duplicate table details removed if found."
     )
 
 def get_icon_path():
