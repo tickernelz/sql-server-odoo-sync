@@ -165,148 +165,146 @@ def compute_file_hash(filepath: str) -> str:
 def send_csv_to_odoo(
     config: configparser.ConfigParser, csv_file: str, table_name: str, db_name: str
 ):
+    """
+    Send CSV file to Odoo and manage CSV attachments, keeping only the 3 latest files.
+
+    Args:
+        config: Configuration parser object containing Odoo credentials
+        csv_file: Path to the CSV file to upload
+        table_name: Name of the table being synced
+        db_name: Name of the database being synced
+    """
+    # Extract Odoo connection details
     url = config["Odoo"]["url"]
     db = config["Odoo"]["db"]
     username = config["Odoo"]["username"]
     password = config["Odoo"]["password"]
 
-    common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
-    uid = common.authenticate(db, username, password, {})
-    if not uid:
-        raise Exception("Failed to authenticate to Odoo.")
+    try:
+        # Setup XML-RPC connections
+        common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
+        uid = common.authenticate(db, username, password, {})
+        if not uid:
+            raise Exception("Failed to authenticate to Odoo.")
 
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
+        models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
 
-    with open(csv_file, "rb") as f:
-        file_data = f.read()
-    file_base64 = base64.b64encode(file_data).decode("utf-8")
-    file_name = os.path.basename(csv_file)
+        # Prepare and upload new CSV file
+        with open(csv_file, "rb") as f:
+            file_data = f.read()
+        file_base64 = base64.b64encode(file_data).decode("utf-8")
+        file_name = os.path.basename(csv_file)
 
-    attachment_id = models.execute_kw(
-        db,
-        uid,
-        password,
-        "ir.attachment",
-        "create",
-        [{"name": file_name, "datas": file_base64, "mimetype": "text/csv"}],
-    )
-
-    with connect_to_sql_server_for_db(config, db_name) as conn, conn.cursor() as cursor:
-        cursor.execute(f"""
-            SELECT 
-                COLUMN_NAME,
-                DATA_TYPE,
-                IS_NULLABLE,
-                CHARACTER_MAXIMUM_LENGTH,
-                COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') as IS_PRIMARY_KEY
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_NAME = '{table_name}'
-        """)
-        columns = cursor.fetchall()
-
-    sync_data = {
-        "name": table_name,
-        "database_name": db_name,
-    }
-
-    existing_ids = models.execute_kw(
-        db,
-        uid,
-        password,
-        "mssql.sync.data",
-        "search",
-        [
-            [
-                ["name", "=", table_name],
-                ["database_name", "=", db_name],
-            ]
-        ],
-    )
-
-    if existing_ids:
-        sync_data_id = existing_ids[0]
-        models.execute_kw(
-            db, uid, password, "mssql.sync.data", "write", [[sync_data_id], sync_data]
-        )
-    else:
-        sync_data_id = models.execute_kw(
-            db, uid, password, "mssql.sync.data", "create", [sync_data]
+        # Create new attachment
+        attachment_id = models.execute_kw(
+            db, uid, password, "ir.attachment", "create",
+            [{"name": file_name, "datas": file_base64, "mimetype": "text/csv"}]
         )
 
-    # Only create details if they do not already exist
-    for column in columns:
-        column_name = column[0]
-        existing_detail_ids = models.execute_kw(
-            db,
-            uid,
-            password,
-            "mssql.sync.table.details",
-            "search",
-            [
-                [
-                    ["sync_data_id", "=", sync_data_id],
-                    ["column_name", "=", column_name],
-                ]
-            ],
+        # Find existing sync data record or create new one
+        sync_data = {
+            "name": table_name,
+            "database_name": db_name,
+        }
+
+        existing_ids = models.execute_kw(
+            db, uid, password, "mssql.sync.data", "search",
+            [[["name", "=", table_name], ["database_name", "=", db_name]]]
         )
 
-        if not existing_detail_ids:
-            column_data = {
-                "sync_data_id": sync_data_id,
-                "column_name": column_name,
-                "data_type": column[1],
-                "is_nullable": column[2] == "YES",
-                "max_length": column[3] or 0,
-                "is_primary_key": bool(column[4]),
-            }
+        if existing_ids:
+            sync_data_id = existing_ids[0]
             models.execute_kw(
-                db,
-                uid,
-                password,
-                "mssql.sync.table.details",
-                "create",
-                [column_data],
+                db, uid, password, "mssql.sync.data", "write",
+                [[sync_data_id], sync_data]
+            )
+        else:
+            sync_data_id = models.execute_kw(
+                db, uid, password, "mssql.sync.data", "create",
+                [sync_data]
             )
 
-    # Clean up any duplicates that may already be in the database
-    existing_details = models.execute_kw(
-        db,
-        uid,
-        password,
-        "mssql.sync.table.details",
-        "search_read",
-        [[["sync_data_id", "=", sync_data_id]]],
-        {"fields": ["id", "column_name"], "order": "column_name"},
-    )
+        # Get column information from SQL Server
+        with connect_to_sql_server_for_db(config, db_name) as conn, conn.cursor() as cursor:
+            cursor.execute("""
+                SELECT
+                    COLUMN_NAME,
+                    DATA_TYPE,
+                    IS_NULLABLE,
+                    CHARACTER_MAXIMUM_LENGTH,
+                    COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') as IS_PRIMARY_KEY
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_NAME = ?
+            """, (table_name,))
+            columns = cursor.fetchall()
 
-    duplicates_to_remove = []
-    unique_cols = set()
-    for detail in existing_details:
-        col_name = detail["column_name"]
-        if col_name in unique_cols:
-            duplicates_to_remove.append(detail["id"])
-        else:
-            unique_cols.add(col_name)
+        # Batch process column details
+        column_details = []
+        existing_columns = set()
 
-    if duplicates_to_remove:
+        # Get existing column details
+        existing_details = models.execute_kw(
+            db, uid, password, "mssql.sync.table.details", "search_read",
+            [[["sync_data_id", "=", sync_data_id]]],
+            {"fields": ["column_name"]}
+        )
+        existing_columns = {detail["column_name"] for detail in existing_details}
+
+        # Prepare new column details
+        for column in columns:
+            column_name = column[0]
+            if column_name not in existing_columns:
+                column_details.append({
+                    "sync_data_id": sync_data_id,
+                    "column_name": column_name,
+                    "data_type": column[1],
+                    "is_nullable": column[2] == "YES",
+                    "max_length": column[3] or 0,
+                    "is_primary_key": bool(column[4]),
+                })
+
+        # Batch create new column details
+        if column_details:
+            models.execute_kw(
+                db, uid, password, "mssql.sync.table.details", "create",
+                [column_details]
+            )
+
+        # Create table data record
+        table_data = {"sync_data_id": sync_data_id, "attachment_id": attachment_id}
         models.execute_kw(
-            db,
-            uid,
-            password,
-            "mssql.sync.table.details",
-            "unlink",
-            [duplicates_to_remove],
+            db, uid, password, "mssql.sync.table.data", "create",
+            [table_data]
         )
 
-    table_data = {"sync_data_id": sync_data_id, "attachment_id": attachment_id}
-    models.execute_kw(
-        db, uid, password, "mssql.sync.table.data", "create", [table_data]
-    )
+        # Clean up old CSV files - keep only 3 latest
+        old_attachments = models.execute_kw(
+            db, uid, password, "ir.attachment", "search_read",
+            [[
+                ["name", "like", f"{table_name}%.csv"],
+                ["id", "!=", attachment_id]
+            ]],
+            {"fields": ["id", "create_date"], "order": "create_date desc"}
+        )
 
-    logging.info(
-        f"Uploaded `{file_name}` to Odoo for table `{table_name}` in DB `{db_name}` "
-        f"(sync_data_id: {sync_data_id}). Duplicate table details removed if found."
-    )
+        if len(old_attachments) > 2:  # Keep only 2 old + 1 new = 3 total
+            attachments_to_delete = [att["id"] for att in old_attachments[2:]]
+            if attachments_to_delete:
+                models.execute_kw(
+                    db, uid, password, "ir.attachment", "unlink",
+                    [attachments_to_delete]
+                )
+                logging.info(f"Cleaned up {len(attachments_to_delete)} old CSV files for table {table_name}")
+
+        logging.info(
+            f"Successfully uploaded '{file_name}' to Odoo for table '{table_name}' in DB '{db_name}' "
+            f"(sync_data_id: {sync_data_id})"
+        )
+
+    except Exception as e:
+        error_msg = f"Error uploading CSV to Odoo: {str(e)}"
+        logging.error(error_msg)
+        raise Exception(error_msg) from e
 
 
 def get_icon_path():
