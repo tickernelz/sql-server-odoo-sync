@@ -509,6 +509,24 @@ class MainWindow(QMainWindow):
                         csv_file_path = fetch_table_data_as_csv(
                             connection, table, db_name
                         )
+
+                        # Keep only 3 latest CSV files for this table
+                        csv_pattern = os.path.join(
+                            "generated_csv", f"{db_name}_{table}_*.csv"
+                        )
+                        existing_csvs = sorted(
+                            Path().glob(csv_pattern), key=os.path.getctime, reverse=True
+                        )
+                        # Skip the newest file (just created) and remove all but 2 older files
+                        for old_file in existing_csvs[3:]:
+                            try:
+                                os.remove(old_file)
+                                logging.info(f"Removed old CSV file: {old_file}")
+                            except Exception as e:
+                                logging.warning(
+                                    f"Failed to remove old CSV file {old_file}: {e}"
+                                )
+
                         file_hash = compute_file_hash(csv_file_path)
                         prev_hash_path = os.path.join(
                             "generated_csv", f"{db_name}_{table}_hash.txt"
