@@ -39,18 +39,6 @@ jobs:
             artifact_name: sql-server-odoo-sync-macos-x86_64.tar.gz
             artifact_path: dist/sql-server-odoo-sync-macos-x86_64.tar.gz
             content_type: application/gzip
-            
-          # macOS Apple Silicon build
-          - os: macos
-            runner: macos-14  # Apple Silicon runner
-            arch: arm64
-            build_cmd: |
-              python -m PyInstaller --clean --noconfirm main.spec
-              mv dist/main dist/sql-server-odoo-sync-macos-arm64
-              cd dist && tar -czf sql-server-odoo-sync-macos-arm64.tar.gz sql-server-odoo-sync-macos-arm64
-            artifact_name: sql-server-odoo-sync-macos-arm64.tar.gz
-            artifact_path: dist/sql-server-odoo-sync-macos-arm64.tar.gz
-            content_type: application/gzip
 
           # Linux build
           - os: linux
@@ -305,12 +293,11 @@ jobs:
           body: |
             ## SQL Server to Odoo Sync - Release ${{ github.ref_name }}
             
-            This release includes executables for Windows, macOS (Intel & Apple Silicon), and Linux platforms.
+            This release includes executables for Windows, macOS (Intel), and Linux platforms.
             
             ### 📥 Downloads
             - **🪟 Windows**: Download `sql-server-odoo-sync-windows-x86_64.exe`
             - **🍎 macOS (Intel)**: Download `sql-server-odoo-sync-macos-x86_64.tar.gz`
-            - **🍎 macOS (Apple Silicon)**: Download `sql-server-odoo-sync-macos-arm64.tar.gz`
             - **🐧 Linux**: Download `sql-server-odoo-sync-linux-x86_64.tar.gz`
             
             ### 🚀 Features
@@ -330,12 +317,12 @@ jobs:
             3. Ensure Microsoft ODBC Driver 17 for SQL Server is installed
             
             #### macOS
-            1. Download the appropriate file for your Mac:
-               - **Intel Macs**: `sql-server-odoo-sync-macos-x86_64.tar.gz`
-               - **Apple Silicon Macs (M1/M2/M3)**: `sql-server-odoo-sync-macos-arm64.tar.gz`
-            2. Extract: `tar -xzf sql-server-odoo-sync-macos-*.tar.gz`
-            3. Run the executable: `./sql-server-odoo-sync-macos-*`
+            1. Download `sql-server-odoo-sync-macos-x86_64.tar.gz` (Intel Macs only)
+            2. Extract: `tar -xzf sql-server-odoo-sync-macos-x86_64.tar.gz`
+            3. Run the executable: `./sql-server-odoo-sync-macos-x86_64`
             4. Install Microsoft ODBC Driver if needed: `brew install msodbcsql17`
+            
+            **Note**: Apple Silicon Macs (M1/M2/M3) can run the Intel version using Rosetta 2.
             
             #### Linux
             1. Download `sql-server-odoo-sync-linux-x86_64.tar.gz`
