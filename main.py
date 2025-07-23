@@ -29,6 +29,8 @@ import datetime
 import configparser
 import traceback
 import hashlib
+import time
+import socket
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -69,6 +71,9 @@ DEFAULT_CONFIG = {
         "tables_to_sync": "",
         "sync_period": "60",
         "force_sync": "False",
+        "timeout_seconds": "300",
+        "max_retries": "3",
+        "retry_delay": "5",
     },
     "General": {"log_level": "INFO"},
 }
@@ -162,6 +167,20 @@ def compute_file_hash(filepath: str) -> str:
     return hasher.hexdigest()
 
 
+def check_file_size_warning(filepath: str, max_size_mb: int = 50):
+    """Check file size and log warning if it's too large"""
+    file_size = os.path.getsize(filepath)
+    file_size_mb = file_size / (1024 * 1024)
+    
+    if file_size_mb > max_size_mb:
+        logging.warning(
+            f"Large file detected: {filepath} ({file_size_mb:.2f} MB). "
+            f"This may cause timeout issues. Consider increasing timeout_seconds in config."
+        )
+    
+    return file_size
+
+
 def send_csv_to_odoo(
     config: configparser.ConfigParser, csv_file: str, table_name: str, db_name: str
 ):
@@ -169,20 +188,58 @@ def send_csv_to_odoo(
     db = config["Odoo"]["db"]
     username = config["Odoo"]["username"]
     password = config["Odoo"]["password"]
-
-    common = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/common")
-    uid = common.authenticate(db, username, password, {})
+    
+    # Get timeout and retry settings
+    timeout_seconds = int(config.get("Sync", "timeout_seconds", fallback="300"))
+    max_retries = int(config.get("Sync", "max_retries", fallback="3"))
+    retry_delay = int(config.get("Sync", "retry_delay", fallback="5"))
+    
+    # Set socket timeout
+    socket.setdefaulttimeout(timeout_seconds)
+    
+    def create_server_proxy_with_timeout(endpoint):
+        """Create ServerProxy with timeout handling"""
+        return xmlrpc.client.ServerProxy(
+            f"{url}{endpoint}",
+            allow_none=True,
+            use_builtin_types=True
+        )
+    
+    def execute_with_retry(func, *args, **kwargs):
+        """Execute function with retry logic"""
+        last_exception = None
+        for attempt in range(max_retries):
+            try:
+                return func(*args, **kwargs)
+            except (xmlrpc.client.ProtocolError, socket.timeout, ConnectionError, OSError) as e:
+                last_exception = e
+                if attempt < max_retries - 1:
+                    logging.warning(f"Attempt {attempt + 1} failed: {str(e)}. Retrying in {retry_delay} seconds...")
+                    time.sleep(retry_delay)
+                else:
+                    logging.error(f"All {max_retries} attempts failed. Last error: {str(e)}")
+        raise last_exception
+    
+    # Authenticate with retry
+    common = create_server_proxy_with_timeout("/xmlrpc/2/common")
+    uid = execute_with_retry(common.authenticate, db, username, password, {})
     if not uid:
         raise Exception("Failed to authenticate to Odoo.")
+    
+    models = create_server_proxy_with_timeout("/xmlrpc/2/object")
 
-    models = xmlrpc.client.ServerProxy(f"{url}/xmlrpc/2/object")
-
+    # Check file size and warn if large
+    file_size = check_file_size_warning(csv_file)
+    
     with open(csv_file, "rb") as f:
         file_data = f.read()
     file_base64 = base64.b64encode(file_data).decode("utf-8")
     file_name = os.path.basename(csv_file)
 
-    attachment_id = models.execute_kw(
+    # Create attachment with retry
+    logging.info(f"Creating attachment for {file_name} (size: {file_size} bytes)")
+    attachment_id = execute_with_retry(
+        models.execute_kw,
         db,
         uid,
         password,
@@ -209,7 +266,8 @@ def send_csv_to_odoo(
         "database_name": db_name,
     }
 
-    existing_ids = models.execute_kw(
+    existing_ids = execute_with_retry(
+        models.execute_kw,
         db,
         uid,
         password,
@@ -225,18 +283,21 @@ def send_csv_to_odoo(
 
     if existing_ids:
         sync_data_id = existing_ids[0]
-        models.execute_kw(
+        execute_with_retry(
+            models.execute_kw,
             db, uid, password, "mssql.sync.data", "write", [[sync_data_id], sync_data]
         )
     else:
-        sync_data_id = models.execute_kw(
+        sync_data_id = execute_with_retry(
+            models.execute_kw,
             db, uid, password, "mssql.sync.data", "create", [sync_data]
         )
 
     # Only create details if they do not already exist
     for column in columns:
         column_name = column[0]
-        existing_detail_ids = models.execute_kw(
+        existing_detail_ids = execute_with_retry(
+            models.execute_kw,
             db,
             uid,
             password,
@@ -259,7 +320,8 @@ def send_csv_to_odoo(
                 "max_length": column[3] or 0,
                 "is_primary_key": bool(column[4]),
             }
-            models.execute_kw(
+            execute_with_retry(
+                models.execute_kw,
                 db,
                 uid,
                 password,
@@ -269,7 +331,8 @@ def send_csv_to_odoo(
             )
 
     # Clean up any duplicates that may already be in the database
-    existing_details = models.execute_kw(
+    existing_details = execute_with_retry(
+        models.execute_kw,
         db,
         uid,
         password,
@@ -289,7 +352,8 @@ def send_csv_to_odoo(
             unique_cols.add(col_name)
 
     if duplicates_to_remove:
-        models.execute_kw(
+        execute_with_retry(
+            models.execute_kw,
             db,
             uid,
             password,
@@ -299,7 +363,8 @@ def send_csv_to_odoo(
         )
 
     table_data = {"sync_data_id": sync_data_id, "attachment_id": attachment_id}
-    models.execute_kw(
+    execute_with_retry(
+        models.execute_kw,
         db, uid, password, "mssql.sync.table.data", "create", [table_data]
     )
 
@@ -401,6 +466,23 @@ class MainWindow(QMainWindow):
         self.force_check.setChecked(self.config["Sync"]["force_sync"].lower() == "true")
         layout.addWidget(self.force_check)
 
+        # Timeout settings
+        timeout_layout = QHBoxLayout()
+        timeout_layout.addWidget(QLabel("Timeout (seconds):"))
+        self.timeout_spin = QSpinBox()
+        self.timeout_spin.setRange(30, 3600)
+        self.timeout_spin.setValue(int(self.config.get("Sync", "timeout_seconds", fallback="300")))
+        timeout_layout.addWidget(self.timeout_spin)
+        layout.addLayout(timeout_layout)
+
+        retry_layout = QHBoxLayout()
+        retry_layout.addWidget(QLabel("Max Retries:"))
+        self.retry_spin = QSpinBox()
+        self.retry_spin.setRange(1, 10)
+        self.retry_spin.setValue(int(self.config.get("Sync", "max_retries", fallback="3")))
+        retry_layout.addWidget(self.retry_spin)
+        layout.addLayout(retry_layout)
+
         # Buttons
         btn_layout = QHBoxLayout()
         self.save_btn = QPushButton("Save Config")
@@ -477,6 +559,8 @@ class MainWindow(QMainWindow):
         self.config["Sync"]["tables_to_sync"] = self.tables_edit.text()
         self.config["Sync"]["sync_period"] = str(self.sync_spin.value())
         self.config["Sync"]["force_sync"] = str(self.force_check.isChecked())
+        self.config["Sync"]["timeout_seconds"] = str(self.timeout_spin.value())
+        self.config["Sync"]["max_retries"] = str(self.retry_spin.value())
 
         with open(self.config_path, "w", encoding="utf-8") as f:
             self.config.write(f)
