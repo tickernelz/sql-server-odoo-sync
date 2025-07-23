@@ -172,13 +172,13 @@ jobs:
           brew tap microsoft/mssql-release https://github.com/Microsoft/homebrew-mssql-release || true
           brew update || true
           
-          # Install with automatic license acceptance
+          # Install with automatic license acceptance using yes command
           echo "Installing Microsoft ODBC Driver 17..."
-          echo "YES" | HOMEBREW_NO_ENV_FILTERING=1 ACCEPT_EULA=Y brew install msodbcsql17 || true
+          timeout 300 bash -c 'yes "YES" | HOMEBREW_NO_ENV_FILTERING=1 ACCEPT_EULA=Y brew install msodbcsql17' || true
           
           # Also try installing mssql-tools
           echo "Installing SQL Server tools..."
-          echo "YES" | HOMEBREW_NO_ENV_FILTERING=1 ACCEPT_EULA=Y brew install mssql-tools || true
+          timeout 300 bash -c 'yes "YES" | HOMEBREW_NO_ENV_FILTERING=1 ACCEPT_EULA=Y brew install mssql-tools' || true
           
           # Verify installation
           if brew list | grep -q msodbcsql17; then
@@ -203,11 +203,16 @@ jobs:
           # -*- mode: python ; coding: utf-8 -*-
           import sys
           
+          # Platform-specific data files
+          datas = []
+          if sys.platform == 'win32':
+              datas.append(('icon.ico', '.'))
+          
           a = Analysis(
               ['main.py'],
               pathex=[],
               binaries=[],
-              datas=[('icon.ico', '.') if sys.platform == 'win32' else []],
+              datas=datas,
               hiddenimports=['PyQt6.QtCore', 'PyQt6.QtGui', 'PyQt6.QtWidgets'],
               hookspath=[],
               hooksconfig={},
