@@ -1,0 +1,4 @@
+PyQt6>=6.6.0
+pyodbc>=4.0.39
+requests>=2.31.0
+PyInstaller>=6.0.0
