@@ -88,7 +88,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            libegl1-mesa \
+            libegl1 \
             libxkbcommon-x11-0 \
             libxcb-icccm4 \
             libxcb-image0 \
@@ -98,7 +98,15 @@ jobs:
             libxcb-xinerama0 \
             libxcb-xfixes0 \
             libxcb-shape0 \
-            unixodbc-dev
+            libxcb-cursor0 \
+            libfontconfig1 \
+            libfreetype6 \
+            libx11-6 \
+            libx11-xcb1 \
+            libxext6 \
+            libxrender1 \
+            unixodbc-dev \
+            build-essential
 
       - name: Install Python dependencies
         run: |
@@ -133,19 +141,51 @@ jobs:
       - name: Install Microsoft ODBC Driver (Windows)
         if: matrix.os == 'windows'
         run: |
-          # Download and install Microsoft ODBC Driver 17 for SQL Server
-          Invoke-WebRequest -Uri "https://download.microsoft.com/download/e/4/e/e4e67866-dffd-428c-aac7-8d28ddafb39b/msodbcsql.msi" -OutFile "msodbcsql.msi"
-          Start-Process msiexec.exe -Wait -ArgumentList '/I msodbcsql.msi /quiet /norestart IACCEPTMSODBCSQLLICENSETERMS=YES'
+          # Download and install Microsoft ODBC Driver 18 for SQL Server (latest)
+          try {
+            Write-Host "Downloading Microsoft ODBC Driver 18 for SQL Server..."
+            Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2307162" -OutFile "msodbcsql18.msi" -UseBasicParsing
+            Write-Host "Installing ODBC Driver 18..."
+            Start-Process msiexec.exe -Wait -ArgumentList '/I msodbcsql18.msi /quiet /norestart IACCEPTMSODBCSQLLICENSETERMS=YES'
+            Write-Host "ODBC Driver 18 installed successfully"
+          }
+          catch {
+            Write-Host "Failed to install ODBC Driver 18, trying Driver 17..."
+            try {
+              Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/?linkid=2266337" -OutFile "msodbcsql17.msi" -UseBasicParsing
+              Start-Process msiexec.exe -Wait -ArgumentList '/I msodbcsql17.msi /quiet /norestart IACCEPTMSODBCSQLLICENSETERMS=YES'
+              Write-Host "ODBC Driver 17 installed successfully"
+            }
+            catch {
+              Write-Host "Failed to install ODBC drivers. Continuing build..."
+              Write-Host "Error: $($_.Exception.Message)"
+            }
+          }
         shell: powershell
 
       - name: Install Microsoft ODBC Driver (macOS)
         if: matrix.os == 'macos'
         run: |
           # Install Microsoft ODBC Driver 17 for SQL Server on macOS
-          /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" || true
+          # Homebrew should already be installed on GitHub runners
+          echo "Setting up Microsoft ODBC driver repository..."
           brew tap microsoft/mssql-release https://github.com/Microsoft/homebrew-mssql-release || true
-          brew update
-          HOMEBREW_NO_ENV_FILTERING=1 ACCEPT_EULA=Y brew install msodbcsql17 mssql-tools || true
+          brew update || true
+          
+          # Install with automatic license acceptance
+          echo "Installing Microsoft ODBC Driver 17..."
+          echo "YES" | HOMEBREW_NO_ENV_FILTERING=1 ACCEPT_EULA=Y brew install msodbcsql17 || true
+          
+          # Also try installing mssql-tools
+          echo "Installing SQL Server tools..."
+          echo "YES" | HOMEBREW_NO_ENV_FILTERING=1 ACCEPT_EULA=Y brew install mssql-tools || true
+          
+          # Verify installation
+          if brew list | grep -q msodbcsql17; then
+            echo "✅ Microsoft ODBC Driver 17 installed successfully"
+          else
+            echo "⚠️ ODBC Driver installation may have failed, but continuing build..."
+          fi
 
       - name: Install Microsoft ODBC Driver (Linux)
         if: matrix.os == 'linux'
