@@ -8,6 +8,8 @@ Features:
 - Sync only when data has changed, with optional "force sync"
 - Logs saved in /logs with date-time filenames
 - Packable with PyInstaller (includes a small built-in icon)
+- Asynchronous processing with progress bar
+- Non-blocking UI during sync operations
 
 Install Requirements (example):
   pip install pyqt6 pyodbc requests xmlrpclib (or use the standard library's xmlrpc)
@@ -47,9 +49,11 @@ from PyQt6.QtWidgets import (
     QMessageBox,
     QSpinBox,
     QCheckBox,
+    QProgressBar,
+    QTextEdit,
 )
-from PyQt6.QtGui import QIcon, QAction, QCursor
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QIcon, QAction, QCursor, QFontDatabase, QFont
+from PyQt6.QtCore import QTimer, Qt, QThread, pyqtSignal
 
 import pyodbc
 import xmlrpc.client
@@ -381,14 +385,225 @@ def get_icon_path():
         return "icon.ico"
 
 
+def get_font_path():
+    """Get the path to the embedded font"""
+    if getattr(sys, "frozen", False):
+        return os.path.join(sys._MEIPASS, "fonts", "JetBrainsMono-Regular.ttf")
+    else:
+        return os.path.join("fonts", "JetBrainsMono-Regular.ttf")
+
+
+def load_custom_font():
+    """Load the custom monospace font and return the font family name"""
+    font_path = get_font_path()
+    
+    # Try to load the custom font
+    if os.path.exists(font_path):
+        try:
+            font_id = QFontDatabase.addApplicationFont(font_path)
+            if font_id != -1:
+                font_families = QFontDatabase.applicationFontFamilies(font_id)
+                if font_families:
+                    logging.info(f"Successfully loaded custom font: {font_families[0]}")
+                    return font_families[0]
+        except Exception as e:
+            logging.warning(f"Failed to load custom font from {font_path}: {e}")
+    else:
+        logging.warning(f"Custom font file not found: {font_path}")
+    
+    # Fallback to system monospace fonts based on platform
+    fallback_fonts = {
+        "win32": ["Consolas", "Courier New", "Lucida Console"],
+        "darwin": ["SF Mono", "Monaco", "Menlo", "Courier New"],
+        "linux": ["DejaVu Sans Mono", "Liberation Mono", "Courier New"]
+    }
+    
+    platform_key = "linux"  # default
+    if sys.platform == "win32":
+        platform_key = "win32"
+    elif sys.platform == "darwin":
+        platform_key = "darwin"
+    
+    # Try each fallback font until we find one that exists
+    for font_name in fallback_fonts[platform_key]:
+        font = QFont(font_name)
+        if QFontDatabase.families().count(font_name) > 0:
+            logging.info(f"Using fallback monospace font: {font_name}")
+            return font_name
+    
+    # Ultimate fallback
+    logging.warning("No suitable monospace font found, using system default")
+    return "monospace"
+
+
+class SyncWorker(QThread):
+    """Worker thread for performing sync operations asynchronously"""
+    
+    # Signals for communication with main thread
+    progress_updated = pyqtSignal(int, str)  # progress percentage, status message
+    sync_completed = pyqtSignal(bool, str)   # success, message
+    log_message = pyqtSignal(str)            # log message for display
+    
+    def __init__(self, config, force_sync=False):
+        super().__init__()
+        self.config = config
+        self.force_sync = force_sync
+        self.is_cancelled = False
+        
+    def cancel(self):
+        """Cancel the sync operation"""
+        self.is_cancelled = True
+        
+    def run(self):
+        """Main sync operation running in separate thread"""
+        try:
+            self.progress_updated.emit(0, "Starting sync operation...")
+            
+            databases_str = self.config["Database"]["databases"]
+            database_list = [d.strip() for d in databases_str.split(",") if d.strip()]
+            
+            if not database_list:
+                self.sync_completed.emit(False, "No databases configured")
+                return
+            
+            total_operations = 0
+            completed_operations = 0
+            
+            # First pass: count total operations
+            for db_name in database_list:
+                if self.is_cancelled:
+                    self.sync_completed.emit(False, "Sync cancelled by user")
+                    return
+                    
+                try:
+                    with connect_to_sql_server_for_db(self.config, db_name) as connection:
+                        all_tables = fetch_tables_list(connection)
+                        
+                        to_sync = self.config["Sync"]["tables_to_sync"].strip()
+                        if to_sync:
+                            table_list = [x.strip() for x in to_sync.split(",") if x.strip()]
+                        else:
+                            table_list = all_tables
+                        
+                        total_operations += len(table_list)
+                except Exception as e:
+                    self.log_message.emit(f"Error connecting to database {db_name}: {str(e)}")
+                    continue
+            
+            if total_operations == 0:
+                self.sync_completed.emit(False, "No tables to sync")
+                return
+            
+            self.progress_updated.emit(5, f"Found {total_operations} tables to process...")
+            
+            # Second pass: perform actual sync
+            for db_name in database_list:
+                if self.is_cancelled:
+                    self.sync_completed.emit(False, "Sync cancelled by user")
+                    return
+                
+                try:
+                    self.progress_updated.emit(
+                        int((completed_operations / total_operations) * 100),
+                        f"Connecting to database: {db_name}"
+                    )
+                    
+                    with connect_to_sql_server_for_db(self.config, db_name) as connection:
+                        all_tables = fetch_tables_list(connection)
+                        
+                        to_sync = self.config["Sync"]["tables_to_sync"].strip()
+                        if to_sync:
+                            table_list = [x.strip() for x in to_sync.split(",") if x.strip()]
+                        else:
+                            table_list = all_tables
+                        
+                        for table in table_list:
+                            if self.is_cancelled:
+                                self.sync_completed.emit(False, "Sync cancelled by user")
+                                return
+                            
+                            progress_pct = int((completed_operations / total_operations) * 100)
+                            self.progress_updated.emit(
+                                progress_pct,
+                                f"Processing {db_name}.{table} ({completed_operations + 1}/{total_operations})"
+                            )
+                            
+                            try:
+                                # Generate CSV
+                                csv_file_path = fetch_table_data_as_csv(connection, table, db_name)
+                                self.log_message.emit(f"Generated CSV for {db_name}.{table}")
+                                
+                                # Clean up old CSV files
+                                csv_pattern = os.path.join("generated_csv", f"{db_name}_{table}_*.csv")
+                                existing_csvs = sorted(
+                                    Path().glob(csv_pattern), key=os.path.getctime, reverse=True
+                                )
+                                for old_file in existing_csvs[3:]:
+                                    try:
+                                        os.remove(old_file)
+                                        logging.info(f"Removed old CSV file: {old_file}")
+                                    except Exception as e:
+                                        logging.warning(f"Failed to remove old CSV file {old_file}: {e}")
+                                
+                                # Check if sync is needed
+                                file_hash = compute_file_hash(csv_file_path)
+                                prev_hash_path = os.path.join("generated_csv", f"{db_name}_{table}_hash.txt")
+                                
+                                if os.path.exists(prev_hash_path):
+                                    with open(prev_hash_path, "r", encoding="utf-8") as hf:
+                                        old_hash = hf.read().strip()
+                                else:
+                                    old_hash = ""
+                                
+                                if self.force_sync or (file_hash != old_hash):
+                                    self.progress_updated.emit(
+                                        progress_pct,
+                                        f"Uploading {db_name}.{table} to Odoo..."
+                                    )
+                                    
+                                    send_csv_to_odoo(self.config, csv_file_path, table, db_name)
+                                    
+                                    with open(prev_hash_path, "w", encoding="utf-8") as hf:
+                                        hf.write(file_hash)
+                                    
+                                    self.log_message.emit(f"✓ Uploaded {db_name}.{table}")
+                                else:
+                                    self.log_message.emit(f"⚬ No changes in {db_name}.{table}, skipped")
+                                
+                            except Exception as e:
+                                error_msg = f"✗ Error processing {db_name}.{table}: {str(e)}"
+                                self.log_message.emit(error_msg)
+                                logging.error(f"Error processing table {table} in DB {db_name}: {e}")
+                            
+                            completed_operations += 1
+                            
+                except Exception as e:
+                    error_msg = f"Error with database {db_name}: {str(e)}"
+                    self.log_message.emit(error_msg)
+                    logging.error(f"Error with database {db_name}: {e}")
+                    continue
+            
+            if not self.is_cancelled:
+                self.progress_updated.emit(100, "Sync completed successfully!")
+                self.sync_completed.emit(True, f"Successfully processed {completed_operations} tables")
+                logging.info("Sync completed successfully.")
+            
+        except Exception as e:
+            error_msg = f"Fatal error during sync: {str(e)}"
+            self.log_message.emit(error_msg)
+            logging.error(f"Fatal error during sync: {e}\n{traceback.format_exc()}")
+            self.sync_completed.emit(False, error_msg)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config_path, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.config_path = config_path
         self.config = load_config(config_path)
+        self.sync_worker = None
 
         self.setWindowTitle("SQL to Odoo Sync App")
-        self.resize(600, 300)
+        self.resize(700, 500)
 
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
@@ -483,6 +698,30 @@ class MainWindow(QMainWindow):
         retry_layout.addWidget(self.retry_spin)
         layout.addLayout(retry_layout)
 
+        # Progress section
+        progress_layout = QVBoxLayout()
+        progress_layout.addWidget(QLabel("Sync Progress:"))
+        
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        progress_layout.addWidget(self.progress_bar)
+        
+        self.status_label = QLabel("Ready")
+        self.status_label.setStyleSheet("color: #666; font-style: italic;")
+        progress_layout.addWidget(self.status_label)
+        
+        # Log display
+        self.log_display = QTextEdit()
+        self.log_display.setMaximumHeight(120)
+        self.log_display.setReadOnly(True)
+        
+        # Set custom monospace font
+        monospace_font_family = load_custom_font()
+        self.log_display.setStyleSheet(f"background-color: #f5f5f5; font-family: '{monospace_font_family}'; font-size: 9pt;")
+        progress_layout.addWidget(self.log_display)
+        
+        layout.addLayout(progress_layout)
+
         # Buttons
         btn_layout = QHBoxLayout()
         self.save_btn = QPushButton("Save Config")
@@ -492,6 +731,12 @@ class MainWindow(QMainWindow):
         self.sync_btn = QPushButton("Sync Now")
         self.sync_btn.clicked.connect(self.perform_sync)
         btn_layout.addWidget(self.sync_btn)
+        
+        self.cancel_btn = QPushButton("Cancel")
+        self.cancel_btn.clicked.connect(self.cancel_sync)
+        self.cancel_btn.setVisible(False)
+        btn_layout.addWidget(self.cancel_btn)
+        
         layout.addLayout(btn_layout)
 
         # Timer
@@ -542,6 +787,9 @@ class MainWindow(QMainWindow):
         self.activateWindow()
 
     def exit_app(self):
+        if self.sync_worker and self.sync_worker.isRunning():
+            self.sync_worker.cancel()
+            self.sync_worker.wait(3000)  # Wait up to 3 seconds for graceful shutdown
         self.tray_icon.hide()
         QApplication.quit()
 
@@ -572,75 +820,106 @@ class MainWindow(QMainWindow):
         )
 
     def perform_sync(self):
+        """Start asynchronous sync operation"""
+        if self.sync_worker and self.sync_worker.isRunning():
+            QMessageBox.information(self, "Sync in Progress", "A sync operation is already running.")
+            return
+        
+        # Update config from UI before syncing
+        self.update_config_from_ui()
+        
+        # Create and start worker thread
         force = self.force_check.isChecked()
-        try:
-            databases_str = self.config["Database"]["databases"]
-            database_list = [d.strip() for d in databases_str.split(",") if d.strip()]
-
-            for db_name in database_list:
-                with connect_to_sql_server_for_db(self.config, db_name) as connection:
-                    all_tables = fetch_tables_list(connection)
-
-                    to_sync = self.tables_edit.text().strip()
-                    if to_sync:
-                        table_list = [
-                            x.strip() for x in to_sync.split(",") if x.strip()
-                        ]
-                    else:
-                        table_list = all_tables
-
-                    for table in table_list:
-                        csv_file_path = fetch_table_data_as_csv(
-                            connection, table, db_name
-                        )
-
-                        # Keep only 3 latest CSV files for this table
-                        csv_pattern = os.path.join(
-                            "generated_csv", f"{db_name}_{table}_*.csv"
-                        )
-                        existing_csvs = sorted(
-                            Path().glob(csv_pattern), key=os.path.getctime, reverse=True
-                        )
-                        # Skip the newest file (just created) and remove all but 2 older files
-                        for old_file in existing_csvs[3:]:
-                            try:
-                                os.remove(old_file)
-                                logging.info(f"Removed old CSV file: {old_file}")
-                            except Exception as e:
-                                logging.warning(
-                                    f"Failed to remove old CSV file {old_file}: {e}"
-                                )
-
-                        file_hash = compute_file_hash(csv_file_path)
-                        prev_hash_path = os.path.join(
-                            "generated_csv", f"{db_name}_{table}_hash.txt"
-                        )
-
-                        if os.path.exists(prev_hash_path):
-                            with open(prev_hash_path, "r", encoding="utf-8") as hf:
-                                old_hash = hf.read().strip()
-                        else:
-                            old_hash = ""
-
-                        if force or (file_hash != old_hash):
-                            send_csv_to_odoo(self.config, csv_file_path, table, db_name)
-                            with open(prev_hash_path, "w", encoding="utf-8") as hf:
-                                hf.write(file_hash)
-                        else:
-                            logging.info(
-                                f"No change detected for table `{table}` in DB `{db_name}`. Skipping upload."
-                            )
-
-            logging.info("Sync completed successfully.")
+        self.sync_worker = SyncWorker(self.config, force)
+        
+        # Connect signals
+        self.sync_worker.progress_updated.connect(self.on_progress_updated)
+        self.sync_worker.sync_completed.connect(self.on_sync_completed)
+        self.sync_worker.log_message.connect(self.on_log_message)
+        
+        # Update UI state
+        self.sync_btn.setEnabled(False)
+        self.cancel_btn.setVisible(True)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setValue(0)
+        self.log_display.clear()
+        
+        # Start the worker
+        self.sync_worker.start()
+        
+    def cancel_sync(self):
+        """Cancel the current sync operation"""
+        if self.sync_worker and self.sync_worker.isRunning():
+            self.sync_worker.cancel()
+            self.status_label.setText("Cancelling sync...")
+            self.cancel_btn.setEnabled(False)
+    
+    def update_config_from_ui(self):
+        """Update config object from UI values"""
+        self.config["Database"]["server"] = self.db_server_edit.text()
+        self.config["Database"]["databases"] = self.db_databases_edit.text()
+        self.config["Database"]["username"] = self.db_user_edit.text()
+        self.config["Database"]["password"] = self.db_pass_edit.text()
+        
+        self.config["Odoo"]["url"] = self.odoo_url_edit.text()
+        self.config["Odoo"]["db"] = self.odoo_db_edit.text()
+        self.config["Odoo"]["username"] = self.odoo_user_edit.text()
+        self.config["Odoo"]["password"] = self.odoo_pass_edit.text()
+        
+        self.config["Sync"]["tables_to_sync"] = self.tables_edit.text()
+        self.config["Sync"]["timeout_seconds"] = str(self.timeout_spin.value())
+        self.config["Sync"]["max_retries"] = str(self.retry_spin.value())
+    
+    def on_progress_updated(self, percentage, message):
+        """Handle progress updates from worker thread"""
+        self.progress_bar.setValue(percentage)
+        self.status_label.setText(message)
+    
+    def on_sync_completed(self, success, message):
+        """Handle sync completion from worker thread"""
+        # Reset UI state
+        self.sync_btn.setEnabled(True)
+        self.cancel_btn.setVisible(False)
+        self.cancel_btn.setEnabled(True)
+        
+        if success:
+            self.progress_bar.setValue(100)
+            self.status_label.setText("Sync completed successfully!")
+            self.status_label.setStyleSheet("color: green; font-weight: bold;")
+            
+            # Show tray notification
             self.tray_icon.showMessage(
                 "Sync Completed",
-                "Data sync to Odoo finished.",
+                message,
                 QSystemTrayIcon.MessageIcon.Information,
                 3000,
             )
-        except Exception as e:
-            logging.error("Error during sync: %s\n%s", e, traceback.format_exc())
-            QMessageBox.critical(self, "Sync Error", str(e))
+            
+            # Hide progress bar after a delay
+            QTimer.singleShot(3000, lambda: self.progress_bar.setVisible(False))
+            QTimer.singleShot(3000, lambda: self.status_label.setStyleSheet("color: #666; font-style: italic;"))
+            QTimer.singleShot(3000, lambda: self.status_label.setText("Ready"))
+        else:
+            self.progress_bar.setVisible(False)
+            self.status_label.setText(f"Sync failed: {message}")
+            self.status_label.setStyleSheet("color: red; font-weight: bold;")
+            
+            # Show error dialog
+            QMessageBox.critical(self, "Sync Error", message)
+            
+            # Reset status after delay
+            QTimer.singleShot(5000, lambda: self.status_label.setStyleSheet("color: #666; font-style: italic;"))
+            QTimer.singleShot(5000, lambda: self.status_label.setText("Ready"))
+    
+    def on_log_message(self, message):
+        """Handle log messages from worker thread"""
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        formatted_message = f"[{timestamp}] {message}"
+        self.log_display.append(formatted_message)
+        
+        # Auto-scroll to bottom
+        scrollbar = self.log_display.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
 
 def main():
@@ -650,6 +929,10 @@ def main():
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
+
+    # Load custom font early to avoid font resolution warnings
+    monospace_font_family = load_custom_font()
+    logging.info(f"Loaded monospace font: {monospace_font_family}")
 
     icon = QIcon(get_icon_path())
     app.setWindowIcon(icon)

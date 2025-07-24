@@ -192,7 +192,7 @@ jobs:
           import sys
           
           # Platform-specific data files
-          datas = []
+          datas = [('fonts/', 'fonts/')]
           if sys.platform == 'win32':
               datas.append(('icon.ico', '.'))
           

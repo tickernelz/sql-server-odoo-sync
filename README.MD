@@ -7,12 +7,17 @@ Features
 --------
 
 -   Modern interface built with `PyQt6`
+-   **Asynchronous processing** with progress bar and real-time feedback
+-   **Non-blocking UI** - remains responsive during long sync operations
+-   **Embedded monospace font** for consistent appearance across all OS
 -   Configurable list of tables to sync (comma-separated or all)
 -   Option to force a sync regardless of data changes
+-   **Cancellable sync operations** with user-friendly progress tracking
 -   Automatically generates `config.ini` if not found
 -   Periodic table data sync based on the configured schedule
 -   Syncs only when data changes are detected (by comparing file hashes)
 -   Log files created with date-time-based filenames in the `logs` directory
+-   **Real-time log display** with timestamps and status indicators
 -   Packable into a single-file executable with `PyInstaller`
 
 Requirements
@@ -109,14 +114,22 @@ Building an Executable
 To build a single-file `.exe` using `PyInstaller`, run:
 
 ```
+pyinstaller main.spec
+
+```
+
+Or alternatively:
+```
 pyinstaller --onefile --windowed --icon=icon.ico main.py
 
 ```
 
 Notes:
 
--   The above command bundles everything into one file, including the icon (if provided).
--   The generated .exe will include the UI, tray icon, and all dependencies.
+-   The `main.spec` file includes the embedded font and icon automatically
+-   The above command bundles everything into one file, including the icon and fonts
+-   The generated .exe will include the UI, tray icon, embedded fonts, and all dependencies
+-   **Font Integration**: The app now includes JetBrains Mono font to eliminate font warnings and ensure consistent appearance across all platforms
 
 Additional Notes
 ----------------
