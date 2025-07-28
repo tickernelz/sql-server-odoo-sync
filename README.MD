@@ -10,9 +10,15 @@ Features
 -   **Asynchronous processing** with progress bar and real-time feedback
 -   **Non-blocking UI** - remains responsive during long sync operations
 -   **Embedded monospace font** for consistent appearance across all OS
+-   **Thread-safe operations** with proper synchronization mechanisms
+-   **Enhanced security** with SQL injection prevention and input validation
+-   **Intelligent retry logic** for database and Odoo connection failures
+-   **Memory-efficient file handling** with streaming for large files (>50MB)
+-   **File locking** to prevent race conditions during concurrent operations
 -   Configurable list of tables to sync (comma-separated or all)
 -   Option to force a sync regardless of data changes
 -   **Cancellable sync operations** with user-friendly progress tracking
+-   **Robust error handling** with detailed diagnostic messages
 -   Automatically generates `config.ini` if not found
 -   Periodic table data sync based on the configured schedule
 -   Syncs only when data changes are detected (by comparing file hashes)
@@ -77,6 +83,28 @@ The application will look for a file named `config.ini` in the same directory as
 
 You can edit `config.ini` manually or via the app's UI.
 
+Security & Reliability
+----------------------
+
+This application includes several security and reliability enhancements:
+
+### Security Features
+- **SQL Injection Prevention**: All database queries use parameterized statements
+- **Input Validation**: Table names and database names are validated and sanitized
+- **Directory Traversal Protection**: File paths are sanitized to prevent unauthorized access
+
+### Reliability Features
+- **Thread Safety**: Configuration updates and file operations are thread-safe
+- **Retry Logic**: Automatic retry for database and Odoo connection failures (configurable)
+- **Memory Management**: Large files (>50MB) are processed in chunks to prevent memory issues
+- **File Locking**: Prevents race conditions when multiple operations access the same files
+- **Enhanced Error Handling**: Detailed error messages help diagnose connection and sync issues
+
+### Error Prevention
+- **"No tables to sync" Error**: Enhanced diagnostics for connection failures
+- **Connection Timeouts**: Configurable timeout settings with proper cleanup
+- **Resource Management**: Proper cleanup of database connections and file handles
+
 Usage
 -----
 
@@ -137,6 +165,31 @@ Additional Notes
 - Ensure the SQL Server driver is installed on your machine (e.g., Microsoft ODBC Driver for SQL Server).\
 - This application checks if table data has changed by computing an `MD5` hash of the CSV file. If the hash matches the previously stored one (or if `force_sync` is off), it will skip sending the file to Odoo.\
 - If you want to customize the code base into multiple modules, you can safely split it into separate `.py` files as needed.
+
+Troubleshooting
+---------------
+
+### Common Issues
+
+**"No tables to sync" Error**
+- Check database connection settings
+- Verify database permissions
+- Ensure tables exist in the specified database
+- Check if configuration was modified during sync
+
+**Connection Timeouts**
+- Increase timeout settings in configuration
+- Check network connectivity to SQL Server and Odoo
+- Verify firewall settings
+
+**Memory Issues with Large Files**
+- The application automatically handles files >50MB with streaming
+- For very large datasets, consider splitting tables or using selective sync
+
+**File Access Errors**
+- Ensure the application has write permissions to the working directory
+- Check if antivirus software is blocking file operations
+- Verify sufficient disk space for CSV exports
 
 License
 -------

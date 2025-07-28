@@ -33,6 +33,7 @@ import traceback
 import hashlib
 import time
 import socket
+import threading
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -130,24 +131,57 @@ def connect_to_sql_server_for_db(
     return pyodbc.connect(conn_str)
 
 
+def fetch_tables_list_with_retry(connection: pyodbc.Connection, max_retries=3):
+    """Fetch tables list with retry logic"""
+    for attempt in range(max_retries):
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute("""
+                    SELECT TABLE_NAME
+                    FROM INFORMATION_SCHEMA.TABLES
+                    WHERE TABLE_TYPE='BASE TABLE'
+                """)
+                tables = [row[0] for row in cursor.fetchall()]
+                if not tables:
+                    logging.warning(f"No tables found in database (attempt {attempt + 1})")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+                        continue
+                return tables
+        except Exception as e:
+            logging.error(f"Error fetching tables (attempt {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(2)
+            else:
+                raise
+    return []
+
 def fetch_tables_list(connection: pyodbc.Connection):
-    with connection.cursor() as cursor:
-        cursor.execute("""
-            SELECT TABLE_NAME
-            FROM INFORMATION_SCHEMA.TABLES
-            WHERE TABLE_TYPE='BASE TABLE'
-        """)
-        return [row[0] for row in cursor.fetchall()]
+    """Legacy function for backward compatibility"""
+    return fetch_tables_list_with_retry(connection)
 
 
 def fetch_table_data_as_csv(
     connection: pyodbc.Connection, table_name: str, db_name: str
 ) -> str:
+    # Validate table name to prevent SQL injection
+    if not table_name.replace('_', '').replace('-', '').isalnum():
+        raise ValueError(f"Invalid table name: {table_name}")
+
+    # Validate db_name to prevent directory traversal
+    if not db_name.replace('_', '').replace('-', '').isalnum():
+        raise ValueError(f"Invalid database name: {db_name}")
+
     csv_dir = "generated_csv"
     os.makedirs(csv_dir, exist_ok=True)
+
+    # Sanitize filename components
+    safe_db_name = "".join(c for c in db_name if c.isalnum() or c in '_-')
+    safe_table_name = "".join(c for c in table_name if c.isalnum() or c in '_-')
+
     csv_file = os.path.join(
         csv_dir,
-        f"{db_name}_{table_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        f"{safe_db_name}_{safe_table_name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
     )
 
     with (
@@ -155,7 +189,8 @@ def fetch_table_data_as_csv(
         open(csv_file, "w", newline="", encoding="utf-8") as f,
     ):
         writer = csv.writer(f)
-        cursor.execute(f"SELECT * FROM [{table_name}]")
+        # Use parameterized query to prevent SQL injection
+        cursor.execute("SELECT * FROM [" + table_name.replace(']', ']]') + "]")
         writer.writerow([desc[0] for desc in cursor.description])
         for row in cursor.fetchall():
             writer.writerow(row)
@@ -175,13 +210,13 @@ def check_file_size_warning(filepath: str, max_size_mb: int = 50):
     """Check file size and log warning if it's too large"""
     file_size = os.path.getsize(filepath)
     file_size_mb = file_size / (1024 * 1024)
-    
+
     if file_size_mb > max_size_mb:
         logging.warning(
             f"Large file detected: {filepath} ({file_size_mb:.2f} MB). "
             f"This may cause timeout issues. Consider increasing timeout_seconds in config."
         )
-    
+
     return file_size
 
 
@@ -192,15 +227,15 @@ def send_csv_to_odoo(
     db = config["Odoo"]["db"]
     username = config["Odoo"]["username"]
     password = config["Odoo"]["password"]
-    
+
     # Get timeout and retry settings
     timeout_seconds = int(config.get("Sync", "timeout_seconds", fallback="300"))
     max_retries = int(config.get("Sync", "max_retries", fallback="3"))
     retry_delay = int(config.get("Sync", "retry_delay", fallback="5"))
-    
+
     # Set socket timeout
     socket.setdefaulttimeout(timeout_seconds)
-    
+
     def create_server_proxy_with_timeout(endpoint):
         """Create ServerProxy with timeout handling"""
         return xmlrpc.client.ServerProxy(
@@ -208,7 +243,7 @@ def send_csv_to_odoo(
             allow_none=True,
             use_builtin_types=True
         )
-    
+
     def execute_with_retry(func, *args, **kwargs):
         """Execute function with retry logic"""
         last_exception = None
@@ -223,22 +258,34 @@ def send_csv_to_odoo(
                 else:
                     logging.error(f"All {max_retries} attempts failed. Last error: {str(e)}")
         raise last_exception
-    
+
     # Authenticate with retry
     common = create_server_proxy_with_timeout("/xmlrpc/2/common")
     uid = execute_with_retry(common.authenticate, db, username, password, {})
     if not uid:
         raise Exception("Failed to authenticate to Odoo.")
-    
+
     models = create_server_proxy_with_timeout("/xmlrpc/2/object")
 
     # Check file size and warn if large
     file_size = check_file_size_warning(csv_file)
-    
-    with open(csv_file, "rb") as f:
-        file_data = f.read()
-    file_base64 = base64.b64encode(file_data).decode("utf-8")
     file_name = os.path.basename(csv_file)
+
+    # Stream large files to avoid memory issues
+    if file_size > 50 * 1024 * 1024:  # 50MB threshold
+        # For very large files, read in chunks
+        file_base64 = ""
+        with open(csv_file, "rb") as f:
+            while True:
+                chunk = f.read(8192)  # 8KB chunks
+                if not chunk:
+                    break
+                file_base64 += base64.b64encode(chunk).decode("utf-8")
+    else:
+        # For smaller files, read normally
+        with open(csv_file, "rb") as f:
+            file_data = f.read()
+        file_base64 = base64.b64encode(file_data).decode("utf-8")
 
     # Create attachment with retry
     logging.info(f"Creating attachment for {file_name} (size: {file_size} bytes)")
@@ -253,7 +300,7 @@ def send_csv_to_odoo(
     )
 
     with connect_to_sql_server_for_db(config, db_name) as conn, conn.cursor() as cursor:
-        cursor.execute(f"""
+        cursor.execute("""
             SELECT 
                 COLUMN_NAME,
                 DATA_TYPE,
@@ -261,8 +308,8 @@ def send_csv_to_odoo(
                 CHARACTER_MAXIMUM_LENGTH,
                 COLUMNPROPERTY(OBJECT_ID(TABLE_NAME), COLUMN_NAME, 'IsIdentity') as IS_PRIMARY_KEY
             FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_NAME = '{table_name}'
-        """)
+            WHERE TABLE_NAME = ?
+        """, (table_name,))
         columns = cursor.fetchall()
 
     sync_data = {
@@ -396,7 +443,7 @@ def get_font_path():
 def load_custom_font():
     """Load the custom monospace font and return the font family name"""
     font_path = get_font_path()
-    
+
     # Try to load the custom font
     if os.path.exists(font_path):
         try:
@@ -410,27 +457,27 @@ def load_custom_font():
             logging.warning(f"Failed to load custom font from {font_path}: {e}")
     else:
         logging.warning(f"Custom font file not found: {font_path}")
-    
+
     # Fallback to system monospace fonts based on platform
     fallback_fonts = {
         "win32": ["Consolas", "Courier New", "Lucida Console"],
         "darwin": ["SF Mono", "Monaco", "Menlo", "Courier New"],
         "linux": ["DejaVu Sans Mono", "Liberation Mono", "Courier New"]
     }
-    
+
     platform_key = "linux"  # default
     if sys.platform == "win32":
         platform_key = "win32"
     elif sys.platform == "darwin":
         platform_key = "darwin"
-    
+
     # Try each fallback font until we find one that exists
     for font_name in fallback_fonts[platform_key]:
         font = QFont(font_name)
         if QFontDatabase.families().count(font_name) > 0:
             logging.info(f"Using fallback monospace font: {font_name}")
             return font_name
-    
+
     # Ultimate fallback
     logging.warning("No suitable monospace font found, using system default")
     return "monospace"
@@ -438,101 +485,106 @@ def load_custom_font():
 
 class SyncWorker(QThread):
     """Worker thread for performing sync operations asynchronously"""
-    
+
     # Signals for communication with main thread
     progress_updated = pyqtSignal(int, str)  # progress percentage, status message
     sync_completed = pyqtSignal(bool, str)   # success, message
     log_message = pyqtSignal(str)            # log message for display
-    
+
     def __init__(self, config, force_sync=False):
         super().__init__()
         self.config = config
         self.force_sync = force_sync
         self.is_cancelled = False
-        
+
     def cancel(self):
         """Cancel the sync operation"""
         self.is_cancelled = True
-        
+
     def run(self):
         """Main sync operation running in separate thread"""
         try:
             self.progress_updated.emit(0, "Starting sync operation...")
-            
+
             databases_str = self.config["Database"]["databases"]
             database_list = [d.strip() for d in databases_str.split(",") if d.strip()]
-            
+
             if not database_list:
                 self.sync_completed.emit(False, "No databases configured")
                 return
-            
+
             total_operations = 0
             completed_operations = 0
-            
+
             # First pass: count total operations
             for db_name in database_list:
                 if self.is_cancelled:
                     self.sync_completed.emit(False, "Sync cancelled by user")
                     return
-                    
+
                 try:
                     with connect_to_sql_server_for_db(self.config, db_name) as connection:
                         all_tables = fetch_tables_list(connection)
-                        
+
                         to_sync = self.config["Sync"]["tables_to_sync"].strip()
                         if to_sync:
                             table_list = [x.strip() for x in to_sync.split(",") if x.strip()]
                         else:
                             table_list = all_tables
-                        
+
                         total_operations += len(table_list)
                 except Exception as e:
                     self.log_message.emit(f"Error connecting to database {db_name}: {str(e)}")
                     continue
-            
+
             if total_operations == 0:
-                self.sync_completed.emit(False, "No tables to sync")
+                error_msg = "No tables to sync. Possible causes:\n"
+                error_msg += "- Database connection failed\n"
+                error_msg += "- No tables found in specified databases\n"
+                error_msg += "- Configuration changed during sync\n"
+                error_msg += "- Database permissions insufficient"
+                self.sync_completed.emit(False, error_msg)
                 return
-            
+
             self.progress_updated.emit(5, f"Found {total_operations} tables to process...")
-            
+
             # Second pass: perform actual sync
             for db_name in database_list:
                 if self.is_cancelled:
                     self.sync_completed.emit(False, "Sync cancelled by user")
                     return
-                
+
                 try:
                     self.progress_updated.emit(
                         int((completed_operations / total_operations) * 100),
                         f"Connecting to database: {db_name}"
                     )
-                    
+
                     with connect_to_sql_server_for_db(self.config, db_name) as connection:
                         all_tables = fetch_tables_list(connection)
-                        
+
                         to_sync = self.config["Sync"]["tables_to_sync"].strip()
                         if to_sync:
                             table_list = [x.strip() for x in to_sync.split(",") if x.strip()]
                         else:
                             table_list = all_tables
-                        
+
                         for table in table_list:
                             if self.is_cancelled:
                                 self.sync_completed.emit(False, "Sync cancelled by user")
                                 return
-                            
+
                             progress_pct = int((completed_operations / total_operations) * 100)
                             self.progress_updated.emit(
                                 progress_pct,
                                 f"Processing {db_name}.{table} ({completed_operations + 1}/{total_operations})"
                             )
-                            
+
                             try:
                                 # Generate CSV
                                 csv_file_path = fetch_table_data_as_csv(connection, table, db_name)
                                 self.log_message.emit(f"Generated CSV for {db_name}.{table}")
-                                
+
                                 # Clean up old CSV files
                                 csv_pattern = os.path.join("generated_csv", f"{db_name}_{table}_*.csv")
                                 existing_csvs = sorted(
@@ -544,50 +596,88 @@ class SyncWorker(QThread):
                                         logging.info(f"Removed old CSV file: {old_file}")
                                     except Exception as e:
                                         logging.warning(f"Failed to remove old CSV file {old_file}: {e}")
-                                
-                                # Check if sync is needed
+
+                                # Check if sync is needed with file locking
                                 file_hash = compute_file_hash(csv_file_path)
                                 prev_hash_path = os.path.join("generated_csv", f"{db_name}_{table}_hash.txt")
-                                
-                                if os.path.exists(prev_hash_path):
-                                    with open(prev_hash_path, "r", encoding="utf-8") as hf:
-                                        old_hash = hf.read().strip()
-                                else:
-                                    old_hash = ""
-                                
-                                if self.force_sync or (file_hash != old_hash):
-                                    self.progress_updated.emit(
-                                        progress_pct,
-                                        f"Uploading {db_name}.{table} to Odoo..."
-                                    )
-                                    
-                                    send_csv_to_odoo(self.config, csv_file_path, table, db_name)
-                                    
-                                    with open(prev_hash_path, "w", encoding="utf-8") as hf:
-                                        hf.write(file_hash)
-                                    
-                                    self.log_message.emit(f"✓ Uploaded {db_name}.{table}")
-                                else:
-                                    self.log_message.emit(f"⚬ No changes in {db_name}.{table}, skipped")
-                                
+                                lock_path = prev_hash_path + ".lock"
+
+                                # Use file locking to prevent race conditions
+                                import fcntl
+                                try:
+                                    with open(lock_path, "w") as lock_file:
+                                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+
+                                        if os.path.exists(prev_hash_path):
+                                            with open(prev_hash_path, "r", encoding="utf-8") as hf:
+                                                old_hash = hf.read().strip()
+                                        else:
+                                            old_hash = ""
+
+                                        if self.force_sync or (file_hash != old_hash):
+                                            self.progress_updated.emit(
+                                                progress_pct,
+                                                f"Uploading {db_name}.{table} to Odoo..."
+                                            )
+
+                                            send_csv_to_odoo(self.config, csv_file_path, table, db_name)
+
+                                            with open(prev_hash_path, "w", encoding="utf-8") as hf:
+                                                hf.write(file_hash)
+
+                                            self.log_message.emit(f"✓ Uploaded {db_name}.{table}")
+                                        else:
+                                            self.log_message.emit(f"⚬ No changes in {db_name}.{table}, skipped")
+
+                                        fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                                except ImportError:
+                                    # Fallback for Windows (fcntl not available)
+                                    if os.path.exists(prev_hash_path):
+                                        with open(prev_hash_path, "r", encoding="utf-8") as hf:
+                                            old_hash = hf.read().strip()
+                                    else:
+                                        old_hash = ""
+
+                                    if self.force_sync or (file_hash != old_hash):
+                                        self.progress_updated.emit(
+                                            progress_pct,
+                                            f"Uploading {db_name}.{table} to Odoo..."
+                                        )
+
+                                        send_csv_to_odoo(self.config, csv_file_path, table, db_name)
+
+                                        with open(prev_hash_path, "w", encoding="utf-8") as hf:
+                                            hf.write(file_hash)
+
+                                        self.log_message.emit(f"✓ Uploaded {db_name}.{table}")
+                                    else:
+                                        self.log_message.emit(f"⚬ No changes in {db_name}.{table}, skipped")
+                                finally:
+                                    # Clean up lock file
+                                    try:
+                                        if os.path.exists(lock_path):
+                                            os.remove(lock_path)
+                                    except OSError:
+                                        pass
+
                             except Exception as e:
                                 error_msg = f"✗ Error processing {db_name}.{table}: {str(e)}"
                                 self.log_message.emit(error_msg)
                                 logging.error(f"Error processing table {table} in DB {db_name}: {e}")
-                            
+
                             completed_operations += 1
-                            
+
                 except Exception as e:
                     error_msg = f"Error with database {db_name}: {str(e)}"
                     self.log_message.emit(error_msg)
                     logging.error(f"Error with database {db_name}: {e}")
                     continue
-            
+
             if not self.is_cancelled:
                 self.progress_updated.emit(100, "Sync completed successfully!")
                 self.sync_completed.emit(True, f"Successfully processed {completed_operations} tables")
                 logging.info("Sync completed successfully.")
-            
+
         except Exception as e:
             error_msg = f"Fatal error during sync: {str(e)}"
             self.log_message.emit(error_msg)
@@ -600,6 +690,7 @@ class MainWindow(QMainWindow):
         super().__init__(*args, **kwargs)
         self.config_path = config_path
         self.config = load_config(config_path)
+        self.config_lock = threading.RLock()
         self.sync_worker = None
 
         self.setWindowTitle("SQL to Odoo Sync App")
@@ -701,25 +792,25 @@ class MainWindow(QMainWindow):
         # Progress section
         progress_layout = QVBoxLayout()
         progress_layout.addWidget(QLabel("Sync Progress:"))
-        
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
         progress_layout.addWidget(self.progress_bar)
-        
+
         self.status_label = QLabel("Ready")
         self.status_label.setStyleSheet("color: #666; font-style: italic;")
         progress_layout.addWidget(self.status_label)
-        
+
         # Log display
         self.log_display = QTextEdit()
         self.log_display.setMaximumHeight(120)
         self.log_display.setReadOnly(True)
-        
+
         # Set custom monospace font
         monospace_font_family = load_custom_font()
         self.log_display.setStyleSheet(f"background-color: #f5f5f5; font-family: '{monospace_font_family}'; font-size: 9pt;")
         progress_layout.addWidget(self.log_display)
-        
+
         layout.addLayout(progress_layout)
 
         # Buttons
@@ -731,12 +822,12 @@ class MainWindow(QMainWindow):
         self.sync_btn = QPushButton("Sync Now")
         self.sync_btn.clicked.connect(self.perform_sync)
         btn_layout.addWidget(self.sync_btn)
-        
+
         self.cancel_btn = QPushButton("Cancel")
         self.cancel_btn.clicked.connect(self.cancel_sync)
         self.cancel_btn.setVisible(False)
         btn_layout.addWidget(self.cancel_btn)
-        
+
         layout.addLayout(btn_layout)
 
         # Timer
@@ -794,27 +885,29 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def save_config(self):
-        self.config["Database"]["server"] = self.db_server_edit.text()
-        self.config["Database"]["databases"] = self.db_databases_edit.text()
-        self.config["Database"]["username"] = self.db_user_edit.text()
-        self.config["Database"]["password"] = self.db_pass_edit.text()
+        with self.config_lock:
+            self.config["Database"]["server"] = self.db_server_edit.text()
+            self.config["Database"]["databases"] = self.db_databases_edit.text()
+            self.config["Database"]["username"] = self.db_user_edit.text()
+            self.config["Database"]["password"] = self.db_pass_edit.text()
 
-        self.config["Odoo"]["url"] = self.odoo_url_edit.text()
-        self.config["Odoo"]["db"] = self.odoo_db_edit.text()
-        self.config["Odoo"]["username"] = self.odoo_user_edit.text()
-        self.config["Odoo"]["password"] = self.odoo_pass_edit.text()
+            self.config["Odoo"]["url"] = self.odoo_url_edit.text()
+            self.config["Odoo"]["db"] = self.odoo_db_edit.text()
+            self.config["Odoo"]["username"] = self.odoo_user_edit.text()
+            self.config["Odoo"]["password"] = self.odoo_pass_edit.text()
 
-        self.config["Sync"]["tables_to_sync"] = self.tables_edit.text()
-        self.config["Sync"]["sync_period"] = str(self.sync_spin.value())
-        self.config["Sync"]["force_sync"] = str(self.force_check.isChecked())
-        self.config["Sync"]["timeout_seconds"] = str(self.timeout_spin.value())
-        self.config["Sync"]["max_retries"] = str(self.retry_spin.value())
+            self.config["Sync"]["tables_to_sync"] = self.tables_edit.text()
+            self.config["Sync"]["sync_period"] = str(self.sync_spin.value())
+            self.config["Sync"]["force_sync"] = str(self.force_check.isChecked())
+            self.config["Sync"]["timeout_seconds"] = str(self.timeout_spin.value())
+            self.config["Sync"]["max_retries"] = str(self.retry_spin.value())
 
-        with open(self.config_path, "w", encoding="utf-8") as f:
-            self.config.write(f)
+            with open(self.config_path, "w", encoding="utf-8") as f:
+                self.config.write(f)
 
-        self.timer.setInterval(int(self.config["Sync"]["sync_period"]) * 1000)
-        logging.info("Configuration saved.")
+            self.timer.setInterval(int(self.config["Sync"]["sync_period"]) * 1000)
+            logging.info("Configuration saved.")
+
         QMessageBox.information(
             self, "Config Saved", "Configuration successfully saved."
         )
@@ -824,51 +917,52 @@ class MainWindow(QMainWindow):
         if self.sync_worker and self.sync_worker.isRunning():
             QMessageBox.information(self, "Sync in Progress", "A sync operation is already running.")
             return
-        
+
         # Update config from UI before syncing
         self.update_config_from_ui()
-        
+
         # Create and start worker thread
         force = self.force_check.isChecked()
         self.sync_worker = SyncWorker(self.config, force)
-        
+
         # Connect signals
         self.sync_worker.progress_updated.connect(self.on_progress_updated)
         self.sync_worker.sync_completed.connect(self.on_sync_completed)
         self.sync_worker.log_message.connect(self.on_log_message)
-        
+
         # Update UI state
         self.sync_btn.setEnabled(False)
         self.cancel_btn.setVisible(True)
         self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
         self.log_display.clear()
-        
+
         # Start the worker
         self.sync_worker.start()
-        
+
     def cancel_sync(self):
         """Cancel the current sync operation"""
         if self.sync_worker and self.sync_worker.isRunning():
             self.sync_worker.cancel()
             self.status_label.setText("Cancelling sync...")
             self.cancel_btn.setEnabled(False)
-    
+
     def update_config_from_ui(self):
         """Update config object from UI values"""
-        self.config["Database"]["server"] = self.db_server_edit.text()
-        self.config["Database"]["databases"] = self.db_databases_edit.text()
-        self.config["Database"]["username"] = self.db_user_edit.text()
-        self.config["Database"]["password"] = self.db_pass_edit.text()
-        
-        self.config["Odoo"]["url"] = self.odoo_url_edit.text()
-        self.config["Odoo"]["db"] = self.odoo_db_edit.text()
-        self.config["Odoo"]["username"] = self.odoo_user_edit.text()
-        self.config["Odoo"]["password"] = self.odoo_pass_edit.text()
-        
-        self.config["Sync"]["tables_to_sync"] = self.tables_edit.text()
-        self.config["Sync"]["timeout_seconds"] = str(self.timeout_spin.value())
-        self.config["Sync"]["max_retries"] = str(self.retry_spin.value())
+        with self.config_lock:
+            self.config["Database"]["server"] = self.db_server_edit.text()
+            self.config["Database"]["databases"] = self.db_databases_edit.text()
+            self.config["Database"]["username"] = self.db_user_edit.text()
+            self.config["Database"]["password"] = self.db_pass_edit.text()
+
+            self.config["Odoo"]["url"] = self.odoo_url_edit.text()
+            self.config["Odoo"]["db"] = self.odoo_db_edit.text()
+            self.config["Odoo"]["username"] = self.odoo_user_edit.text()
+            self.config["Odoo"]["password"] = self.odoo_pass_edit.text()
+
+            self.config["Sync"]["tables_to_sync"] = self.tables_edit.text()
+            self.config["Sync"]["timeout_seconds"] = str(self.timeout_spin.value())
+            self.config["Sync"]["max_retries"] = str(self.retry_spin.value())
     
     def on_progress_updated(self, percentage, message):
         """Handle progress updates from worker thread"""

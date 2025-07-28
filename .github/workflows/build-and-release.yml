@@ -281,6 +281,101 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -R artifacts
 
+      - name: Generate Release Notes
+        id: release_notes
+        run: |
+          # Get the previous tag
+          PREVIOUS_TAG=$(git tag --sort=-version:refname | grep -v "^${{ github.ref_name }}$" | head -n 1)
+          
+          # If no previous tag exists, use the first commit
+          if [ -z "$PREVIOUS_TAG" ]; then
+            PREVIOUS_TAG=$(git rev-list --max-parents=0 HEAD)
+          fi
+          
+          echo "Previous tag: $PREVIOUS_TAG"
+          echo "Current tag: ${{ github.ref_name }}"
+          
+          # Generate changelog
+          CHANGELOG=$(git log --pretty=format:"- %s (%h)" $PREVIOUS_TAG..${{ github.ref_name }} --no-merges)
+          
+          # Count commits
+          COMMIT_COUNT=$(git rev-list --count $PREVIOUS_TAG..${{ github.ref_name }})
+          
+          # Get contributors
+          CONTRIBUTORS=$(git log --pretty=format:"%an" $PREVIOUS_TAG..${{ github.ref_name }} --no-merges | sort | uniq | tr '\n' ', ' | sed 's/, $//')
+          
+          # Create release body
+          cat << EOF > release_body.md
+          ## SQL Server to Odoo Sync - Release ${{ github.ref_name }}
+          
+          This release includes executables for Windows, macOS (Intel), and Linux platforms.
+          
+          ### 📝 What's Changed
+          
+          $CHANGELOG
+          
+          **Full Changelog**: https://github.com/${{ github.repository }}/compare/$PREVIOUS_TAG...${{ github.ref_name }}
+          
+          ### 📊 Release Statistics
+          - **Commits**: $COMMIT_COUNT
+          - **Contributors**: $CONTRIBUTORS
+          
+          ### 📥 Downloads
+          - **🪟 Windows**: Download \`sql-server-odoo-sync-windows-x86_64.exe\`
+          - **🍎 macOS (Intel)**: Download \`sql-server-odoo-sync-macos-x86_64.tar.gz\`
+          - **🐧 Linux**: Download \`sql-server-odoo-sync-linux-x86_64.tar.gz\`
+          
+          ### 🚀 Features
+          - Modern PyQt6 desktop interface with system tray integration
+          - Automated synchronization of SQL Server tables to Odoo 14
+          - Multi-database support with selective table sync
+          - Intelligent change detection using MD5 hashing
+          - Comprehensive logging and error handling
+          - CSV export with automatic file management
+          - Configurable retry logic and timeout settings
+          
+          ### 📋 Installation
+          
+          #### Windows
+          1. Download \`sql-server-odoo-sync-windows-x86_64.exe\`
+          2. Run the executable directly
+          3. Ensure Microsoft ODBC Driver 17 for SQL Server is installed
+          
+          #### macOS
+          1. Download \`sql-server-odoo-sync-macos-x86_64.tar.gz\` (Intel Macs only)
+          2. Extract: \`tar -xzf sql-server-odoo-sync-macos-x86_64.tar.gz\`
+          3. Run the executable: \`./sql-server-odoo-sync-macos-x86_64\`
+          4. Install Microsoft ODBC Driver if needed: \`brew install msodbcsql17\`
+          
+          **Note**: Apple Silicon Macs (M1/M2/M3) can run the Intel version using Rosetta 2.
+          
+          #### Linux
+          1. Download \`sql-server-odoo-sync-linux-x86_64.tar.gz\`
+          2. Extract: \`tar -xzf sql-server-odoo-sync-linux-x86_64.tar.gz\`
+          3. Make executable: \`chmod +x sql-server-odoo-sync-linux-x86_64\`
+          4. Run: \`./sql-server-odoo-sync-linux-x86_64\`
+          5. Install Microsoft ODBC Driver if needed
+          
+          ### ⚙️ Configuration
+          On first run, the application will create a \`config.ini\` file with default settings. Configure your:
+          - SQL Server connection details
+          - Odoo instance settings
+          - Sync preferences and schedules
+          - Logging levels
+          
+          ### 📚 Documentation
+          For detailed setup and configuration instructions, see the [README.MD](README.MD) file.
+          
+          ### 🔒 Security Note
+          Some antivirus software may flag PyInstaller executables as suspicious. This is a false positive common with packaged Python applications. The source code is available for review in this repository.
+          
+          ### 🐛 System Requirements
+          - **Windows**: Windows 10 or later, Microsoft ODBC Driver 17 for SQL Server
+          - **macOS**: macOS 10.14 or later, Microsoft ODBC Driver 17 for SQL Server
+          - **Linux**: Ubuntu 18.04+ or equivalent, Microsoft ODBC Driver 17 for SQL Server
+          - Network access to both SQL Server and Odoo instances
+          EOF
+
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
@@ -290,64 +385,6 @@ jobs:
           prerelease: false
           files: |
             artifacts/**/*
-          body: |
-            ## SQL Server to Odoo Sync - Release ${{ github.ref_name }}
-            
-            This release includes executables for Windows, macOS (Intel), and Linux platforms.
-            
-            ### 📥 Downloads
-            - **🪟 Windows**: Download `sql-server-odoo-sync-windows-x86_64.exe`
-            - **🍎 macOS (Intel)**: Download `sql-server-odoo-sync-macos-x86_64.tar.gz`
-            - **🐧 Linux**: Download `sql-server-odoo-sync-linux-x86_64.tar.gz`
-            
-            ### 🚀 Features
-            - Modern PyQt6 desktop interface with system tray integration
-            - Automated synchronization of SQL Server tables to Odoo 14
-            - Multi-database support with selective table sync
-            - Intelligent change detection using MD5 hashing
-            - Comprehensive logging and error handling
-            - CSV export with automatic file management
-            - Configurable retry logic and timeout settings
-            
-            ### 📋 Installation
-            
-            #### Windows
-            1. Download `sql-server-odoo-sync-windows-x86_64.exe`
-            2. Run the executable directly
-            3. Ensure Microsoft ODBC Driver 17 for SQL Server is installed
-            
-            #### macOS
-            1. Download `sql-server-odoo-sync-macos-x86_64.tar.gz` (Intel Macs only)
-            2. Extract: `tar -xzf sql-server-odoo-sync-macos-x86_64.tar.gz`
-            3. Run the executable: `./sql-server-odoo-sync-macos-x86_64`
-            4. Install Microsoft ODBC Driver if needed: `brew install msodbcsql17`
-            
-            **Note**: Apple Silicon Macs (M1/M2/M3) can run the Intel version using Rosetta 2.
-            
-            #### Linux
-            1. Download `sql-server-odoo-sync-linux-x86_64.tar.gz`
-            2. Extract: `tar -xzf sql-server-odoo-sync-linux-x86_64.tar.gz`
-            3. Make executable: `chmod +x sql-server-odoo-sync-linux-x86_64`
-            4. Run: `./sql-server-odoo-sync-linux-x86_64`
-            5. Install Microsoft ODBC Driver if needed
-            
-            ### ⚙️ Configuration
-            On first run, the application will create a `config.ini` file with default settings. Configure your:
-            - SQL Server connection details
-            - Odoo instance settings
-            - Sync preferences and schedules
-            - Logging levels
-            
-            ### 📚 Documentation
-            For detailed setup and configuration instructions, see the [README.MD](README.MD) file.
-            
-            ### 🔒 Security Note
-            Some antivirus software may flag PyInstaller executables as suspicious. This is a false positive common with packaged Python applications. The source code is available for review in this repository.
-            
-            ### 🐛 System Requirements
-            - **Windows**: Windows 10 or later, Microsoft ODBC Driver 17 for SQL Server
-            - **macOS**: macOS 10.14 or later, Microsoft ODBC Driver 17 for SQL Server
-            - **Linux**: Ubuntu 18.04+ or equivalent, Microsoft ODBC Driver 17 for SQL Server
-            - Network access to both SQL Server and Odoo instances
+          body_path: release_body.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
