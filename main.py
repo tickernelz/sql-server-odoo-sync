@@ -602,9 +602,10 @@ class SyncWorker(QThread):
                                 prev_hash_path = os.path.join("generated_csv", f"{db_name}_{table}_hash.txt")
                                 lock_path = prev_hash_path + ".lock"
 
-                                # Use file locking to prevent race conditions
-                                import fcntl
+                                # Use file locking to prevent race conditions (Unix/Linux) or simple file-based locking (Windows)
                                 try:
+                                    # Try Unix/Linux file locking first
+                                    import fcntl
                                     with open(lock_path, "w") as lock_file:
                                         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
 
@@ -631,34 +632,55 @@ class SyncWorker(QThread):
 
                                         fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
                                 except ImportError:
-                                    # Fallback for Windows (fcntl not available)
-                                    if os.path.exists(prev_hash_path):
-                                        with open(prev_hash_path, "r", encoding="utf-8") as hf:
-                                            old_hash = hf.read().strip()
-                                    else:
-                                        old_hash = ""
-
-                                    if self.force_sync or (file_hash != old_hash):
-                                        self.progress_updated.emit(
-                                            progress_pct,
-                                            f"Uploading {db_name}.{table} to Odoo..."
-                                        )
-
-                                        send_csv_to_odoo(self.config, csv_file_path, table, db_name)
-
-                                        with open(prev_hash_path, "w", encoding="utf-8") as hf:
-                                            hf.write(file_hash)
-
-                                        self.log_message.emit(f"✓ Uploaded {db_name}.{table}")
-                                    else:
-                                        self.log_message.emit(f"⚬ No changes in {db_name}.{table}, skipped")
-                                finally:
-                                    # Clean up lock file
+                                    # Windows fallback: Use simple file-based locking with retry mechanism
+                                    max_lock_attempts = 10
+                                    lock_acquired = False
+                                    
+                                    for attempt in range(max_lock_attempts):
+                                        try:
+                                            # Try to create lock file exclusively
+                                            with open(lock_path, "x") as lock_file:
+                                                lock_file.write(f"locked_by_pid_{os.getpid()}")
+                                            lock_acquired = True
+                                            break
+                                        except FileExistsError:
+                                            # Lock file exists, wait and retry
+                                            time.sleep(0.1)
+                                            continue
+                                    
+                                    if not lock_acquired:
+                                        # Proceed without lock after timeout (fallback for Windows)
+                                        logging.warning(f"Could not acquire lock for {table}, proceeding without lock")
+                                    
                                     try:
-                                        if os.path.exists(lock_path):
-                                            os.remove(lock_path)
-                                    except OSError:
-                                        pass
+                                        if os.path.exists(prev_hash_path):
+                                            with open(prev_hash_path, "r", encoding="utf-8") as hf:
+                                                old_hash = hf.read().strip()
+                                        else:
+                                            old_hash = ""
+
+                                        if self.force_sync or (file_hash != old_hash):
+                                            self.progress_updated.emit(
+                                                progress_pct,
+                                                f"Uploading {db_name}.{table} to Odoo..."
+                                            )
+
+                                            send_csv_to_odoo(self.config, csv_file_path, table, db_name)
+
+                                            with open(prev_hash_path, "w", encoding="utf-8") as hf:
+                                                hf.write(file_hash)
+
+                                            self.log_message.emit(f"✓ Uploaded {db_name}.{table}")
+                                        else:
+                                            self.log_message.emit(f"⚬ No changes in {db_name}.{table}, skipped")
+                                    finally:
+                                        # Release Windows lock
+                                        if lock_acquired:
+                                            try:
+                                                os.remove(lock_path)
+                                            except OSError:
+                                                pass
+
 
                             except Exception as e:
                                 error_msg = f"✗ Error processing {db_name}.{table}: {str(e)}"
